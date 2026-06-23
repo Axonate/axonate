@@ -15,7 +15,7 @@ a usage dashboard.
 ![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)
 ![LiteLLM](https://img.shields.io/badge/LiteLLM-proxy-6E40C9)
 ![docker](https://img.shields.io/badge/docker-compose-2496ED?logo=docker&logoColor=white)
-![license](https://img.shields.io/badge/license-Apache--2.0-green)
+![license](https://img.shields.io/badge/license-MIT-green)
 
 </div>
 
@@ -116,4 +116,4 @@ POC, deployed and tested. See [`STATUS.md`](STATUS.md) for the tested/not-tested
 
 ## License
 
-[Apache-2.0](LICENSE) © CloudDrove Inc.
+[MIT](LICENSE) © CloudDrove
