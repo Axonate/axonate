@@ -1,0 +1,17 @@
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/services/router"
+    schedule: { interval: "weekly" }
+  - package-ecosystem: "pip"
+    directory: "/services/adapter"
+    schedule: { interval: "weekly" }
+  - package-ecosystem: "docker"
+    directory: "/services/router"
+    schedule: { interval: "weekly" }
+  - package-ecosystem: "docker"
+    directory: "/services/adapter"
+    schedule: { interval: "weekly" }
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule: { interval: "weekly" }
