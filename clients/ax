@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""ax — thin Axonate CLI for the laptop.
+
+Usage:
+  ax "explain this error"                 # model auto
+  ax -m claude "write a haiku"            # pick a model
+  git diff | ax "review this"             # piped stdin (appended to the prompt)
+  ax --no-stream "..."                    # disable streaming
+  ax -s work "remember X"; ax -s work "what did I say?"   # session continuity
+  ax -s work --new "fresh start"          # reset a session
+
+Config (env or ~/.config/axonate/config):
+  AXONATE_URL   gateway base url (default http://127.0.0.1:4100)
+  AXONATE_KEY   bearer key (virtual key, or master key in dev)
+"""
+import argparse
+import json
+import os
+import sys
+import urllib.request
+
+CFG = os.path.expanduser("~/.config/axonate/config")
+SESS_DIR = os.path.expanduser("~/.config/axonate/sessions")
+
+
+def load_session(name):
+    if not name:
+        return []
+    path = os.path.join(SESS_DIR, f"{name}.json")
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return []
+
+
+def save_session(name, messages):
+    if not name:
+        return
+    os.makedirs(SESS_DIR, exist_ok=True)
+    with open(os.path.join(SESS_DIR, f"{name}.json"), "w") as f:
+        json.dump(messages, f)
+
+
+def load_config():
+    cfg = {}
+    if os.path.exists(CFG):
+        with open(CFG) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    cfg[k.strip()] = v.strip()
+    url = os.environ.get("AXONATE_URL", cfg.get("AXONATE_URL", "http://127.0.0.1:4100"))
+    key = os.environ.get("AXONATE_KEY", cfg.get("AXONATE_KEY", ""))
+    return url.rstrip("/"), key
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="ax", description="Axonate CLI")
+    ap.add_argument("prompt", nargs="*", help="prompt text")
+    ap.add_argument("-m", "--model", default="auto", help="model (default: auto)")
+    ap.add_argument("--no-stream", action="store_true", help="disable streaming")
+    ap.add_argument("-s", "--session", default="", help="session name (persists history)")
+    ap.add_argument("--new", action="store_true", help="reset the session before this turn")
+    args = ap.parse_args()
+
+    url, key = load_config()
+    prompt = " ".join(args.prompt)
+    if not sys.stdin.isatty():                 # piped stdin -> append
+        piped = sys.stdin.read().strip()
+        prompt = f"{prompt}\n\n{piped}" if prompt else piped
+    if not prompt:
+        ap.error("no prompt (pass text or pipe stdin)")
+
+    stream = not args.no_stream
+    history = [] if args.new else load_session(args.session)
+    messages = history + [{"role": "user", "content": prompt}]
+    body = json.dumps({
+        "model": args.model,
+        "messages": messages,
+        "stream": stream,
+    }).encode()
+
+    req = urllib.request.Request(
+        f"{url}/v1/chat/completions", data=body,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {key}"} if key else {"Content-Type": "application/json"},
+    )
+
+    try:
+        resp = urllib.request.urlopen(req)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode()
+        try:
+            detail = json.loads(detail).get("detail", detail)
+        except Exception:
+            pass
+        print(f"error {e.code}: {detail}", file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        print(f"cannot reach gateway at {url}: {e.reason}", file=sys.stderr)
+        sys.exit(1)
+
+    route = resp.headers.get("X-Router-Route")
+    if route:
+        print(f"[route: {route}]", file=sys.stderr)
+
+    reply = ""
+    if stream:
+        for raw in resp:
+            line = raw.decode().strip()
+            if not line.startswith("data: "):
+                continue
+            data = line[6:]
+            if data == "[DONE]":
+                break
+            try:
+                delta = json.loads(data)["choices"][0]["delta"].get("content", "")
+                reply += delta
+                sys.stdout.write(delta)
+                sys.stdout.flush()
+            except (json.JSONDecodeError, KeyError, IndexError):
+                continue
+        print()
+    else:
+        data = json.loads(resp.read())
+        reply = data["choices"][0]["message"]["content"]
+        print(reply)
+
+    if args.session and reply:
+        save_session(args.session, messages + [{"role": "assistant", "content": reply}])
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,156 @@
+# Axonate stack. Permanent services (db, litellm, router) run in every profile.
+# poc adds the disposable CLI adapter. prod adds the cloudflared tunnel + real APIs.
+#   docker compose --profile poc  up -d     # local / POC
+#   docker compose --profile prod up -d     # production (no adapter)
+# Redis is defined but commented — enable only when scaling/caching is needed.
+
+x-restart: &restart unless-stopped
+
+services:
+  axonate-db:
+    # pinned by digest (GOLIVE §1 [B]); tag: postgres:16-alpine
+    image: postgres:16-alpine@sha256:e013e867e712fec275706a6c51c966f0bb0c93cfa8f51000f85a15f9865a28cb
+    restart: *restart
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - axonate-db-data:/var/lib/postgresql/data
+    networks: [axonate-net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  axonate-litellm:
+    # pinned by digest (GOLIVE §1 [B]); tag: ghcr.io/berriai/litellm:main-stable
+    image: ghcr.io/berriai/litellm:main-stable@sha256:8f3517476b8293ccc1c3b0da7940d8dabbfe64b013454113f5a3cb68265c439b
+    restart: *restart
+    depends_on:
+      axonate-db:
+        condition: service_healthy
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY}
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}   # spend alerts + daily digest (GOLIVE §2)
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@axonate-db:5432/${POSTGRES_DB}
+      ADAPTER_TOKEN: ${ADAPTER_TOKEN}
+      MINIMAX_API_KEY: ${MINIMAX_API_KEY}
+      MINIMAX_BASE_URL: ${MINIMAX_BASE_URL}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+    volumes:
+      # swap POC->prod by setting LITELLM_CONFIG=litellm_config.prod.yaml in .env
+      - ./services/litellm/${LITELLM_CONFIG:-litellm_config.yaml}:/app/config.yaml:ro
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    ports:
+      - "127.0.0.1:4000:4000"     # LiteLLM usage UI + proxy (localhost only)
+    networks: [axonate-net]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveliness').status<500 else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  axonate-router:
+    build:
+      context: .
+      dockerfile: services/router/Dockerfile
+    restart: *restart
+    depends_on:
+      axonate-db:
+        condition: service_healthy
+      axonate-litellm:
+        condition: service_started
+    environment:
+      LITELLM_URL: http://axonate-litellm:4000
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      AUTH_MODE: ${AUTH_MODE:-dev}
+      ROUTER_DEV_USER: ${ROUTER_DEV_USER:-dev@local}
+      LOG_PROMPTS: ${LOG_PROMPTS:-false}
+      ROUTER_RATE_LIMIT: ${ROUTER_RATE_LIMIT:-60}
+      POSTGRES_HOST: axonate-db
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      CF_ACCESS_TEAM_DOMAIN: ${CF_ACCESS_TEAM_DOMAIN:-}
+      CF_ACCESS_AUD: ${CF_ACCESS_AUD:-}
+    ports:
+      - "127.0.0.1:4100:4100"     # router (localhost only; tunnel reaches it internally in prod)
+    networks: [axonate-net]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4100/health').status<500 else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ---- POC ONLY: disposable CLI adapter. Deleted at the prod swap. ----
+  axonate-adapter:
+    profiles: ["poc"]
+    build:
+      context: services/adapter
+      dockerfile: Dockerfile
+    restart: *restart
+    environment:
+      ADAPTER_TOKEN: ${ADAPTER_TOKEN}
+      ADAPTER_TIMEOUT: ${ADAPTER_TIMEOUT:-300}
+      # claude headless OAuth tokens (from `claude setup-token`), one per account
+      CLAUDE_OAUTH_TOKEN_A: ${CLAUDE_OAUTH_TOKEN_A:-}
+      CLAUDE_OAUTH_TOKEN_B: ${CLAUDE_OAUTH_TOKEN_B:-}
+      CLAUDE_CONFIG_DIR_A: /cfg/acctA
+      CLAUDE_CONFIG_DIR_B: /cfg/acctB
+      CODEX_HOME: /cfg/codex
+      ADAPTER_WRITE_DIR: /work
+      CLAUDE_FLAGS: ${CLAUDE_FLAGS:---permission-mode plan}
+      CODEX_FLAGS: ${CODEX_FLAGS:---sandbox read-only}
+      CLAUDE_CODE_FLAGS: ${CLAUDE_CODE_FLAGS:---permission-mode acceptEdits}
+      CODEX_CODE_FLAGS: ${CODEX_CODE_FLAGS:---sandbox workspace-write}
+    volumes:
+      # named volumes hold the CLI logins -> survive restart/rebuild.
+      # NEVER `docker compose down -v` or you must re-login. See CLAUDE.md.
+      - axonate-claude-acctA:/cfg/acctA
+      - axonate-claude-acctB:/cfg/acctB
+      - axonate-codex:/cfg/codex
+      - axonate-adapter-work:/work
+    networks: [axonate-net]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health').status<500 else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ---- PROD: Cloudflare tunnel. No open inbound ports; only this reaches the gateway. ----
+  axonate-cloudflared:
+    profiles: ["prod"]
+    # GOLIVE §1 [B]: pin by digest at prod setup -> `docker pull cloudflare/cloudflared:VERSION`
+    # then replace with cloudflare/cloudflared@sha256:<digest>
+    image: cloudflare/cloudflared:2025.6.1
+    restart: *restart
+    command: ["tunnel", "--no-autoupdate", "run", "--token", "${CLOUDFLARE_TUNNEL_TOKEN}"]
+    depends_on:
+      axonate-router:
+        condition: service_started
+    networks: [axonate-net]
+
+  # ---- OPTIONAL: enable for caching / shared rate limits when scaling. Off by default. ----
+  # axonate-redis:
+  #   profiles: ["redis"]
+  #   image: redis:7-alpine
+  #   restart: *restart
+  #   volumes: [axonate-redis-data:/data]
+  #   networks: [axonate-net]
+
+networks:
+  axonate-net:
+    driver: bridge
+
+volumes:
+  axonate-db-data:
+  axonate-claude-acctA:
+  axonate-claude-acctB:
+  axonate-codex:
+  axonate-adapter-work:
+  # axonate-redis-data:

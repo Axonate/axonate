@@ -1,0 +1,42 @@
+# Axonate routing policy for model "auto". All opinions live HERE, not in router.py.
+# Edit + restart axonate-router to retune. Rules evaluated top-down; first match wins.
+
+# Backends the router may choose between (must exist as models in litellm_config.yaml).
+backends:
+  claude:
+    cost: 3          # relative cost rank (1=cheapest). Used by the cost/quota signal.
+    strengths: [reasoning, analysis, writing]
+  codex:
+    cost: 3
+    strengths: [code, refactor, debug]
+  minimax:
+    cost: 1          # cheapest/most abundant -> preferred for easy + bulk work
+    strengths: [bulk, transform, summarize]
+
+default: minimax     # fallback when no rule matches
+
+# Keyword rules: if any keyword appears (case-insensitive) in the prompt -> backend.
+keyword_rules:
+  - backend: codex
+    keywords: [code, function, refactor, debug, bug, compile, stack trace, regex, "def ", "class ", import]
+  - backend: minimax
+    keywords: [summarize, summary, translate, bulk, extract, classify, rewrite, transform, list]
+  - backend: claude
+    keywords: [reason, analyze, explain why, design, architecture, trade-off, plan, prove]
+
+# Length rule: very short prompts are "easy" -> bias to the cheap backend.
+length_rule:
+  short_char_threshold: 240   # <= this many chars counts as "easy"
+  short_backend: minimax
+
+# Cost/quota signal. When two paths are plausible, prefer cheaper/abundant for easy tasks
+# and avoid a backend that is near its budget ceiling.
+cost_quota:
+  enabled: true
+  prefer_cheap_for_easy: true        # easy task -> lowest-cost backend
+  avoid_near_limit: true             # skip a backend at/above the threshold of its budget
+  near_limit_fraction: 0.9           # 0.9 = treat >=90% of budget spent as "near limit"
+
+# Optional LLM classifier (off for POC — keyword+length+cost is enough).
+classifier:
+  enabled: false

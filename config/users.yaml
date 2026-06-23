@@ -1,0 +1,6 @@
+# email -> LiteLLM virtual key. Provision keys with scripts/add_user.sh, paste here.
+# In AUTH_MODE=dev this is optional (router falls back to the master key for the dev user).
+# In AUTH_MODE=cloudflare every authorized email MUST appear here or the request is rejected.
+users:
+  # dev@local: sk-...        # example
+  # alice@yourdomain.com: sk-...

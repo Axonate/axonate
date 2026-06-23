@@ -1,0 +1,21 @@
+# secrets — never commit
+.env
+config/poc.env
+config/prod.env
+*.pem
+*.key
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# local
+*.log
+.DS_Store
+
+# local tooling
+.claude/
+backups/
