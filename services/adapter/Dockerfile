@@ -1,6 +1,6 @@
 # Axonate CLI adapter (POC, DISPOSABLE). Bundles node + the Claude/Codex CLIs.
 # Deleted at the production swap.
-FROM python:3.11-slim
+FROM python:3.14-slim
 
 # node 20 for the CLIs
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates git \
