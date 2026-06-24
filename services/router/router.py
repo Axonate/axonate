@@ -18,6 +18,8 @@ import asyncio
 import json
 import os
 import time
+from datetime import datetime, timedelta, timezone
+import math
 from collections import defaultdict, deque
 
 import asyncpg
@@ -129,6 +131,89 @@ def _rate_limited(user: str) -> bool:
         return True
     dq.append(now)
     return False
+
+
+# ---------- trace stats (pure, unit-tested) ----------
+_WINDOWS = {
+    "1h":  (timedelta(hours=1),  timedelta(minutes=5)),
+    "24h": (timedelta(hours=24), timedelta(hours=1)),
+    "7d":  (timedelta(days=7),   timedelta(hours=6)),
+    "all": (None,                timedelta(days=1)),
+}
+
+
+def _p95(values: list) -> int:
+    if not values:
+        return 0
+    s = sorted(values)
+    idx = max(0, math.ceil(0.95 * len(s)) - 1)
+    return int(s[idx])
+
+
+def _stats_from_rows(rows: list, window: str, now: datetime) -> dict:
+    """Aggregate already-fetched trace rows into the dashboard JSON shape.
+    rows: dicts with ts(tz-aware), model_requested, route, latency_ms, total_tokens, status."""
+    span, bucket = _WINDOWS.get(window, _WINDOWS["24h"])
+    lat = [r["latency_ms"] for r in rows if r.get("latency_ms") is not None]
+    reqs = len(rows)
+    errors = sum(1 for r in rows if (r.get("status") or 0) >= 400)
+    total_tokens = sum((r.get("total_tokens") or 0) for r in rows)
+    avg = int(sum(lat) / len(lat)) if lat else 0
+
+    models: dict = {}
+    for r in rows:
+        m = r.get("route") or r.get("model_requested") or "?"
+        d = models.setdefault(m, {"count": 0, "ok": 0, "lat": []})
+        d["count"] += 1
+        if (r.get("status") or 0) < 400:
+            d["ok"] += 1
+        if r.get("latency_ms") is not None:
+            d["lat"].append(r["latency_ms"])
+    by_model = sorted(
+        [{"model": m, "count": d["count"],
+          "success_rate": round(d["ok"] / d["count"], 4) if d["count"] else 0.0,
+          "avg_latency_ms": int(sum(d["lat"]) / len(d["lat"])) if d["lat"] else 0}
+         for m, d in models.items()],
+        key=lambda x: -x["count"])
+
+    classes: dict = {}
+    for r in rows:
+        c = f"{(r.get('status') or 0) // 100}xx"
+        classes[c] = classes.get(c, 0) + 1
+    by_status_class = sorted(({"class": c, "count": n} for c, n in classes.items()),
+                             key=lambda x: x["class"])
+
+    start = (min((r["ts"] for r in rows), default=now - bucket)) if span is None else now - span
+    nbuckets = max(1, min(int((now - start) / bucket) + 1, 500))
+    buckets = []
+    for i in range(nbuckets):
+        b0 = start + i * bucket
+        buckets.append({"t0": b0, "t1": b0 + bucket, "ok": 0, "err": 0})
+    for r in rows:
+        ts = r["ts"]
+        for b in buckets:
+            if b["t0"] <= ts < b["t1"]:
+                if (r.get("status") or 0) >= 400:
+                    b["err"] += 1
+                else:
+                    b["ok"] += 1
+                break
+    series = [{"bucket": b["t0"].replace(microsecond=0).isoformat(),
+               "ok": b["ok"], "err": b["err"]} for b in buckets]
+
+    return {
+        "window": window,
+        "generated_at": now.replace(microsecond=0).isoformat(),
+        "totals": {
+            "requests": reqs, "errors": errors,
+            "error_rate": round(errors / reqs, 4) if reqs else 0.0,
+            "avg_latency_ms": avg, "p95_latency_ms": _p95(lat),
+            "total_tokens": total_tokens, "models": len(models),
+        },
+        "by_model": by_model,
+        "by_status_class": by_status_class,
+        "series": series,
+    }
 
 
 # ---------- lifecycle ----------
