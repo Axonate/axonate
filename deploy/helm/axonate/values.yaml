@@ -1,0 +1,86 @@
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  litellm:
+    repository: ghcr.io/berriai/litellm
+    tag: main-stable
+    digest: "sha256:8f3517476b8293ccc1c3b0da7940d8dabbfe64b013454113f5a3cb68265c439b"
+    pullPolicy: IfNotPresent
+  router:
+    repository: ""            # REQUIRED: your registry, e.g. ghcr.io/you/axonate-router
+    tag: v1.0
+    digest: ""
+    pullPolicy: IfNotPresent
+  cloudflared:
+    repository: cloudflare/cloudflared
+    tag: "2025.6.1"
+    digest: ""                # re-pin by digest at prod setup (GOLIVE §1)
+    pullPolicy: IfNotPresent
+
+litellm:
+  configMode: prod            # poc|prod — selects which config the ConfigMap carries
+  replicas: 1
+  resources: {}
+
+router:
+  replicas: 2                 # stateless — safe to scale
+  authMode: cloudflare        # dev|cloudflare
+  devUser: dev@local
+  logPrompts: false
+  rateLimit: 60
+  cfAccessTeamDomain: ""      # required when authMode=cloudflare
+  cfAccessAud: ""             # required when authMode=cloudflare
+  resources: {}
+
+# Optional in-cluster Postgres (Bitnami subchart). Default OFF → external managed PG.
+postgresql:
+  enabled: false
+  auth:
+    username: axonate
+    password: ""              # set when enabled; mirror into secret.postgres below
+    database: axonate
+  primary:
+    persistence:
+      enabled: true
+      size: 8Gi
+
+cloudflared:
+  enabled: true               # default ingress path: tunnel, no open ports
+  replicas: 1
+  resources: {}
+
+ingress:
+  enabled: false              # opt-in standard ingress to the router Service
+  className: nginx
+  host: axonate.example.com
+  annotations: {}
+  tls:
+    enabled: true
+    clusterIssuer: letsencrypt-prod
+
+backup:
+  enabled: false              # only meaningful with in-cluster PG
+  schedule: "0 3 * * *"
+  image: postgres:16-alpine
+
+serviceAccount:
+  create: true
+  name: ""
+
+# Plain Secret created from these values UNLESS existingSecret is set.
+secret:
+  existingSecret: ""
+  masterKey: ""
+  saltKey: ""
+  postgres:
+    host: ""                  # external PG endpoint (ignored when postgresql.enabled=true)
+    user: axonate
+    password: ""
+    database: axonate
+  tunnelToken: ""             # cloudflared
+  anthropicApiKey: ""
+  openaiApiKey: ""
+  deepseekApiKey: ""
+  minimaxApiKey: ""
+  minimaxBaseUrl: ""

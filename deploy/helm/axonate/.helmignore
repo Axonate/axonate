@@ -1,0 +1,5 @@
+.DS_Store
+*.md
+ci/
+.git/
+.idea/

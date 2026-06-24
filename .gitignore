@@ -19,3 +19,4 @@ venv/
 # local tooling
 .claude/
 backups/
+deploy/helm/axonate/charts/
