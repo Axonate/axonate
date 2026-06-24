@@ -1,0 +1,33 @@
+{{- if .Values.cloudflared.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "axonate.fullname" . }}-cloudflared
+  labels:
+    {{- include "axonate.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cloudflared
+spec:
+  replicas: {{ .Values.cloudflared.replicas }}
+  selector:
+    matchLabels:
+      {{- include "axonate.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: cloudflared
+  template:
+    metadata:
+      labels:
+        {{- include "axonate.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: cloudflared
+    spec:
+      containers:
+        - name: cloudflared
+          image: "{{ .Values.image.cloudflared.repository }}{{ if .Values.image.cloudflared.digest }}@{{ .Values.image.cloudflared.digest }}{{ else }}:{{ .Values.image.cloudflared.tag }}{{ end }}"
+          imagePullPolicy: {{ .Values.image.cloudflared.pullPolicy }}
+          args: ["tunnel", "--no-autoupdate", "run"]
+          env:
+            - name: TUNNEL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "axonate.secretName" . }}
+                  key: CLOUDFLARE_TUNNEL_TOKEN
+          resources: {{- toYaml .Values.cloudflared.resources | nindent 12 }}
+{{- end }}
