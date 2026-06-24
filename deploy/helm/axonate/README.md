@@ -32,7 +32,6 @@ helm install axonate deploy/helm/axonate \
 | Value | Default | Purpose |
 |---|---|---|
 | `image.router.repository` | "" (required) | Your pushed router image |
-| `litellm.configMode` | `prod` | `poc` or `prod` litellm config (from `files/`) |
 | `postgresql.enabled` | `false` | In-cluster Bitnami PG vs external managed |
 | `cloudflared.enabled` | `true` | Tunnel ingress (no open ports) |
 | `ingress.enabled` | `false` | Standard Ingress + cert-manager to the router |

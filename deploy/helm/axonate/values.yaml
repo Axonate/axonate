@@ -19,7 +19,6 @@ image:
     pullPolicy: IfNotPresent
 
 litellm:
-  configMode: prod            # poc|prod — selects which config the ConfigMap carries
   replicas: 1
   resources: {}
 

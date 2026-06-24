@@ -4,7 +4,7 @@ COMPOSE = docker compose --profile $(PROFILE)
 
 .DEFAULT_GOAL := help
 
-.PHONY: help up down logs ps build config smoke login-claude login-codex set-claude-token add-user digest backup restore
+.PHONY: help up down logs ps build config smoke login-claude login-codex set-claude-token add-user digest backup restore helm-sync-config
 
 help:  ## list targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -61,3 +61,6 @@ backup:  ## dump postgres + config to ./backups
 
 restore:  ## restore postgres from a dump (FILE=./backups/xx.sql.gz)
 	./scripts/restore.sh "$(FILE)"
+
+helm-sync-config:  ## copy prod litellm config into the Helm chart files/
+	cp services/litellm/litellm_config.prod.yaml deploy/helm/axonate/files/litellm_config.prod.yaml

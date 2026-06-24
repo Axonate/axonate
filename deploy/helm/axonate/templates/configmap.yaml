@@ -6,5 +6,5 @@ metadata:
     {{- include "axonate.labels" . | nindent 4 }}
 data:
   config.yaml: |
-    {{- $cfgFile := ternary "files/litellm_config.yaml" "files/litellm_config.prod.yaml" (eq .Values.litellm.configMode "poc") }}
-    {{- required (printf "litellm config %s is missing from the chart (run the files/ copy step)" $cfgFile) (.Files.Get $cfgFile) | nindent 4 }}
+    {{- $cfgFile := "files/litellm_config.prod.yaml" }}
+    {{- required (printf "litellm config %s is missing from the chart (run 'make helm-sync-config')" $cfgFile) (.Files.Get $cfgFile) | nindent 4 }}
