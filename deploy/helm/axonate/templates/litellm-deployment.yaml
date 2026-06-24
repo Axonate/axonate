@@ -43,6 +43,7 @@ spec:
             httpGet: { path: /health/liveliness, port: 4000 }
             initialDelaySeconds: 120
             periodSeconds: 15
+            failureThreshold: 30      # tolerate ~128 DB migrations on first boot before killing
           resources: {{- toYaml .Values.litellm.resources | nindent 12 }}
       volumes:
         - name: config
