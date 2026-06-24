@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "axonate.fullname" . }}-litellm
+  labels:
+    {{- include "axonate.labels" . | nindent 4 }}
+    app.kubernetes.io/component: litellm
+spec:
+  replicas: {{ .Values.litellm.replicas }}
+  selector:
+    matchLabels:
+      {{- include "axonate.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: litellm
+  template:
+    metadata:
+      labels:
+        {{- include "axonate.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: litellm
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name | default (include "axonate.fullname" .) }}
+      containers:
+        - name: litellm
+          image: "{{ .Values.image.litellm.repository }}{{ if .Values.image.litellm.digest }}@{{ .Values.image.litellm.digest }}{{ else }}:{{ .Values.image.litellm.tag }}{{ end }}"
+          imagePullPolicy: {{ .Values.image.litellm.pullPolicy }}
+          args: ["--config", "/app/config.yaml", "--port", "4000"]
+          envFrom:
+            - secretRef:
+                name: {{ include "axonate.secretName" . }}
+          ports:
+            - name: http
+              containerPort: 4000
+          volumeMounts:
+            - name: config
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+              readOnly: true
+          readinessProbe:
+            httpGet: { path: /health/liveliness, port: 4000 }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 60      # first boot runs ~128 DB migrations (minutes)
+          livenessProbe:
+            httpGet: { path: /health/liveliness, port: 4000 }
+            initialDelaySeconds: 120
+            periodSeconds: 15
+          resources: {{- toYaml .Values.litellm.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "axonate.fullname" . }}-litellm-config
