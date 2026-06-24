@@ -300,6 +300,35 @@ async def trace_json(request: Request, limit: int = 100):
     return {"rows": [dict(r) for r in rows]}
 
 
+@app.get("/trace/stats")
+async def trace_stats(request: Request, window: str = "24h"):
+    """Aggregated trace metrics for the dashboard. Admin sees all; else own rows only."""
+    if _pool is None:
+        raise HTTPException(503, "trace DB unavailable")
+    if window not in _WINDOWS:
+        window = "24h"
+    span, _ = _WINDOWS[window]
+    now = datetime.now(timezone.utc)
+    conds, args = [], []
+    if span is not None:
+        args.append(now - span)
+        conds.append(f"ts >= ${len(args)}")
+    if not _is_admin(request):
+        try:
+            user, _ = auth_shim.resolve_identity(request.headers)
+        except AuthError as e:
+            raise HTTPException(401, str(e))
+        args.append(user)
+        conds.append(f"user_email = ${len(args)}")
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""SELECT ts,user_email,model_requested,route,reason,latency_ms,
+                       total_tokens,cost,status FROM axonate_trace
+                {where} ORDER BY ts DESC LIMIT 5000""", *args)
+    return _stats_from_rows([dict(r) for r in rows], window, now)
+
+
 @app.get("/trace/view")
 async def trace_view(request: Request, limit: int = 100):
     """Minimal HTML trace table — audit + cost + debugging in one place (GOLIVE §5)."""
