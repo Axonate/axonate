@@ -1,0 +1,21 @@
+Axonate {{ .Chart.AppVersion }} deployed as release "{{ .Release.Name }}".
+
+Services (ClusterIP, no open ports):
+  router : {{ include "axonate.fullname" . }}-router:4100   (health /health)
+  litellm: {{ include "axonate.fullname" . }}-litellm:4000  (health /health/liveliness)
+
+{{- if .Values.cloudflared.enabled }}
+Ingress path: Cloudflare tunnel (cloudflared Deployment). Point the tunnel's public
+hostname at http://{{ include "axonate.fullname" . }}-router:4100 in the Cloudflare dashboard.
+{{- else if .Values.ingress.enabled }}
+Ingress path: https://{{ .Values.ingress.host }}  ->  router Service.
+{{- else }}
+WARNING: neither cloudflared nor ingress is enabled — the gateway has NO external path.
+{{- end }}
+
+First boot: litellm runs ~128 DB migrations (several minutes). Watch:
+  kubectl rollout status deploy/{{ include "axonate.fullname" . }}-litellm
+
+Smoke test via port-forward:
+  kubectl port-forward svc/{{ include "axonate.fullname" . }}-router 4100:4100
+  curl -s localhost:4100/health

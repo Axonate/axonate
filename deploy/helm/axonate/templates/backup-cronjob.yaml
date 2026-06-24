@@ -1,0 +1,31 @@
+{{- if and .Values.postgresql.enabled .Values.backup.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "axonate.fullname" . }}-backup
+  labels:
+    {{- include "axonate.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: pg-dump
+              image: {{ .Values.backup.image | quote }}
+              command: ["/bin/sh", "-c"]
+              args:
+                - 'pg_dump "$DATABASE_URL" | gzip > /backups/axonate-$(date +%F).sql.gz'
+              envFrom:
+                - secretRef:
+                    name: {{ include "axonate.secretName" . }}
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+          volumes:
+            - name: backups
+              emptyDir: {}     # replace with a PVC for durable storage
+{{- end }}
