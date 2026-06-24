@@ -14,6 +14,7 @@ This is permanent (production-grade). It does NOT change at the POC->prod swap.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -132,25 +133,36 @@ def _rate_limited(user: str) -> bool:
 
 # ---------- lifecycle ----------
 
+_TRACE_DDL = """CREATE TABLE IF NOT EXISTS axonate_trace (
+    id BIGSERIAL PRIMARY KEY,
+    ts TIMESTAMPTZ NOT NULL,
+    user_email TEXT, model_requested TEXT, route TEXT, reason TEXT,
+    latency_ms INTEGER, prompt_tokens INTEGER, completion_tokens INTEGER,
+    total_tokens INTEGER, cost DOUBLE PRECISION, status INTEGER,
+    prompt_text TEXT)"""
+
+
 @app.on_event("startup")
 async def _startup():
     global _policy, _pool
     with open(ROUTING_FILE) as f:
         _policy = yaml.safe_load(f)
-    try:
-        _pool = await asyncpg.create_pool(min_size=1, max_size=5, **PG)
-        async with _pool.acquire() as conn:
-            await conn.execute(
-                """CREATE TABLE IF NOT EXISTS axonate_trace (
-                    id BIGSERIAL PRIMARY KEY,
-                    ts TIMESTAMPTZ NOT NULL,
-                    user_email TEXT, model_requested TEXT, route TEXT, reason TEXT,
-                    latency_ms INTEGER, prompt_tokens INTEGER, completion_tokens INTEGER,
-                    total_tokens INTEGER, cost DOUBLE PRECISION, status INTEGER,
-                    prompt_text TEXT)""")
-    except Exception as e:
-        print(f"[startup] trace DB unavailable ({e}); continuing without trace", flush=True)
-        _pool = None
+    # Retry: on first boot the DB may be busy with LiteLLM's migrations, so the pool
+    # connect or the CREATE TABLE can fail transiently. Back off and retry instead of
+    # silently giving up (which previously left the trace table missing until a restart).
+    for attempt in range(1, 11):
+        try:
+            if _pool is None:
+                _pool = await asyncpg.create_pool(min_size=1, max_size=5, **PG)
+            async with _pool.acquire() as conn:
+                await conn.execute(_TRACE_DDL)
+            print(f"[startup] trace table ready (attempt {attempt})", flush=True)
+            return
+        except Exception as e:
+            print(f"[startup] trace DB not ready (attempt {attempt}/10): {e}", flush=True)
+            await asyncio.sleep(min(attempt * 2, 15))
+    print("[startup] trace DB unavailable after retries; continuing without trace", flush=True)
+    _pool = None
 
 
 @app.get("/health")

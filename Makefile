@@ -31,6 +31,9 @@ config:  ## validate compose config
 smoke:  ## run the pre-launch smoke gate
 	./scripts/smoke.sh
 
+doctor:  ## diagnose common misconfig (ADAPTER_TOKEN drift, health)
+	./scripts/doctor.sh
+
 login-claude:  ## print a Claude OAuth token (headless). Then: make set-claude-token TOKEN=.. SLOT=A|B
 	@docker compose --profile poc exec axonate-adapter claude setup-token
 
