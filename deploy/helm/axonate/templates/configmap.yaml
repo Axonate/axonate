@@ -6,4 +6,5 @@ metadata:
     {{- include "axonate.labels" . | nindent 4 }}
 data:
   config.yaml: |
-{{ if eq .Values.litellm.configMode "poc" }}{{ .Files.Get "files/litellm_config.yaml" | indent 4 }}{{ else }}{{ .Files.Get "files/litellm_config.prod.yaml" | indent 4 }}{{ end }}
+    {{- $cfgFile := ternary "files/litellm_config.yaml" "files/litellm_config.prod.yaml" (eq .Values.litellm.configMode "poc") }}
+    {{- required (printf "litellm config %s is missing from the chart (run the files/ copy step)" $cfgFile) (.Files.Get $cfgFile) | nindent 4 }}
