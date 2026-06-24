@@ -18,6 +18,8 @@ import asyncio
 import json
 import os
 import time
+from datetime import datetime, timedelta, timezone
+import math
 from collections import defaultdict, deque
 
 import asyncpg
@@ -131,6 +133,89 @@ def _rate_limited(user: str) -> bool:
     return False
 
 
+# ---------- trace stats (pure, unit-tested) ----------
+_WINDOWS = {
+    "1h":  (timedelta(hours=1),  timedelta(minutes=5)),
+    "24h": (timedelta(hours=24), timedelta(hours=1)),
+    "7d":  (timedelta(days=7),   timedelta(hours=6)),
+    "all": (None,                timedelta(days=1)),
+}
+
+
+def _p95(values: list) -> int:
+    if not values:
+        return 0
+    s = sorted(values)
+    idx = max(0, math.ceil(0.95 * len(s)) - 1)
+    return int(s[idx])
+
+
+def _stats_from_rows(rows: list, window: str, now: datetime) -> dict:
+    """Aggregate already-fetched trace rows into the dashboard JSON shape.
+    rows: dicts with ts(tz-aware), model_requested, route, latency_ms, total_tokens, status."""
+    span, bucket = _WINDOWS.get(window, _WINDOWS["24h"])
+    lat = [r["latency_ms"] for r in rows if r.get("latency_ms") is not None]
+    reqs = len(rows)
+    errors = sum(1 for r in rows if (r.get("status") or 0) >= 400)
+    total_tokens = sum((r.get("total_tokens") or 0) for r in rows)
+    avg = int(sum(lat) / len(lat)) if lat else 0
+
+    models: dict = {}
+    for r in rows:
+        m = r.get("route") or r.get("model_requested") or "?"
+        d = models.setdefault(m, {"count": 0, "ok": 0, "lat": []})
+        d["count"] += 1
+        if (r.get("status") or 0) < 400:
+            d["ok"] += 1
+        if r.get("latency_ms") is not None:
+            d["lat"].append(r["latency_ms"])
+    by_model = sorted(
+        [{"model": m, "count": d["count"],
+          "success_rate": round(d["ok"] / d["count"], 4) if d["count"] else 0.0,
+          "avg_latency_ms": int(sum(d["lat"]) / len(d["lat"])) if d["lat"] else 0}
+         for m, d in models.items()],
+        key=lambda x: -x["count"])
+
+    classes: dict = {}
+    for r in rows:
+        c = f"{(r.get('status') or 0) // 100}xx"
+        classes[c] = classes.get(c, 0) + 1
+    by_status_class = sorted(({"class": c, "count": n} for c, n in classes.items()),
+                             key=lambda x: x["class"])
+
+    start = (min((r["ts"] for r in rows), default=now - bucket)) if span is None else now - span
+    nbuckets = max(1, min(int((now - start) / bucket) + 1, 500))
+    buckets = []
+    for i in range(nbuckets):
+        b0 = start + i * bucket
+        buckets.append({"t0": b0, "t1": b0 + bucket, "ok": 0, "err": 0})
+    for r in rows:
+        ts = r["ts"]
+        for b in buckets:
+            if b["t0"] <= ts < b["t1"]:
+                if (r.get("status") or 0) >= 400:
+                    b["err"] += 1
+                else:
+                    b["ok"] += 1
+                break
+    series = [{"bucket": b["t0"].replace(microsecond=0).isoformat(),
+               "ok": b["ok"], "err": b["err"]} for b in buckets]
+
+    return {
+        "window": window,
+        "generated_at": now.replace(microsecond=0).isoformat(),
+        "totals": {
+            "requests": reqs, "errors": errors,
+            "error_rate": round(errors / reqs, 4) if reqs else 0.0,
+            "avg_latency_ms": avg, "p95_latency_ms": _p95(lat),
+            "total_tokens": total_tokens, "models": len(models),
+        },
+        "by_model": by_model,
+        "by_status_class": by_status_class,
+        "series": series,
+    }
+
+
 # ---------- lifecycle ----------
 
 _TRACE_DDL = """CREATE TABLE IF NOT EXISTS axonate_trace (
@@ -215,23 +300,149 @@ async def trace_json(request: Request, limit: int = 100):
     return {"rows": [dict(r) for r in rows]}
 
 
+@app.get("/trace/stats")
+async def trace_stats(request: Request, window: str = "24h"):
+    """Aggregated trace metrics for the dashboard. Admin sees all; else own rows only."""
+    if _pool is None:
+        raise HTTPException(503, "trace DB unavailable")
+    if window not in _WINDOWS:
+        window = "24h"
+    span, _ = _WINDOWS[window]
+    now = datetime.now(timezone.utc)
+    conds, args = [], []
+    if span is not None:
+        args.append(now - span)
+        conds.append(f"ts >= ${len(args)}")
+    if not _is_admin(request):
+        try:
+            user, _ = auth_shim.resolve_identity(request.headers)
+        except AuthError as e:
+            raise HTTPException(401, str(e))
+        args.append(user)
+        conds.append(f"user_email = ${len(args)}")
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""SELECT ts,user_email,model_requested,route,reason,latency_ms,
+                       total_tokens,cost,status FROM axonate_trace
+                {where} ORDER BY ts DESC LIMIT 5000""", *args)
+    return _stats_from_rows([dict(r) for r in rows], window, now)
+
+
 @app.get("/trace/view")
-async def trace_view(request: Request, limit: int = 100):
-    """Minimal HTML trace table — audit + cost + debugging in one place (GOLIVE §5)."""
-    data = await trace_json(request, limit)
-    head = "<tr><th>time</th><th>user</th><th>requested</th><th>route</th><th>reason</th><th>ms</th><th>tokens</th><th>cost</th><th>status</th></tr>"
-    body = "".join(
-        f"<tr><td>{r['ts']}</td><td>{r['user_email']}</td><td>{r['model_requested']}</td>"
-        f"<td>{r['route']}</td><td>{r['reason']}</td><td>{r['latency_ms']}</td>"
-        f"<td>{r['total_tokens']}</td><td>{r['cost'] or ''}</td><td>{r['status']}</td></tr>"
-        for r in data["rows"])
-    html = (f"<html><head><title>axonate trace</title><style>"
-            "body{font:13px monospace;padding:1rem}table{border-collapse:collapse}"
-            "td,th{border:1px solid #ccc;padding:3px 8px}th{background:#eee}</style></head>"
-            f"<body><h3>axonate trace ({len(data['rows'])} rows)</h3>"
-            f"<table>{head}{body}</table></body></html>")
+async def trace_view():
+    """Self-contained dashboard: cards + charts + filterable tables (GOLIVE §5).
+    Fetches /trace/stats and /trace client-side. Charts via Chart.js CDN with
+    graceful fallback; all other content works offline."""
     from fastapi.responses import HTMLResponse
-    return HTMLResponse(html)
+    return HTMLResponse(_DASHBOARD_HTML)
+
+
+_DASHBOARD_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
+<title>Axonate trace</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{--bg:#0f1117;--card:#1a1d27;--line:#2a2f3a;--fg:#e6e8ee;--mut:#8a90a0;--ok:#3fb950;--warn:#d29922;--err:#f85149;--accent:#58a6ff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.4 system-ui,sans-serif}
+header{display:flex;align-items:center;gap:1rem;flex-wrap:wrap;padding:1rem 1.25rem;border-bottom:1px solid var(--line)}
+h1{font-size:1.1rem;margin:0}.badge{font-size:.75rem;color:var(--mut);border:1px solid var(--line);border-radius:99px;padding:2px 10px}
+select,button{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:5px 9px;font:inherit}
+main{padding:1.25rem;max-width:1100px;margin:0 auto}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.75rem;margin-bottom:1.25rem}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:.85rem 1rem}
+.card .k{color:var(--mut);font-size:.72rem;text-transform:uppercase;letter-spacing:.04em}
+.card .v{font-size:1.5rem;font-weight:600;margin-top:.2rem}
+.grid2{display:grid;grid-template-columns:2fr 1fr;gap:1rem;margin-bottom:1.25rem}
+@media(max-width:760px){.grid2{grid-template-columns:1fr}}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:1rem}
+.panel h2{font-size:.8rem;color:var(--mut);text-transform:uppercase;margin:0 0 .6rem}
+table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
+th{color:var(--mut);font-weight:600}.s2xx{color:var(--ok)}.s4xx{color:var(--warn)}.s5xx,.s0xx{color:var(--err)}
+.filters{display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.6rem}.filters input{flex:1;min-width:120px;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:5px 9px}
+.note{color:var(--mut);font-size:.8rem;padding:1.5rem;text-align:center}
+</style></head><body>
+<header>
+  <h1>Axonate trace</h1>
+  <span id="scope" class="badge">…</span>
+  <span style="flex:1"></span>
+  <label>window <select id="window"><option>1h</option><option selected>24h</option><option>7d</option><option>all</option></select></label>
+  <label><input type="checkbox" id="auto"> auto-refresh</label>
+  <button id="refresh">refresh</button>
+</header>
+<main>
+  <div id="banner"></div>
+  <div class="cards" id="cards"></div>
+  <div class="grid2">
+    <div class="panel"><h2>Requests over time</h2><div id="lineWrap"><canvas id="line" height="120"></canvas></div></div>
+    <div class="panel"><h2>By model</h2><div id="donutWrap"><canvas id="donut" height="120"></canvas></div></div>
+  </div>
+  <div class="panel" style="margin-bottom:1.25rem"><h2>Per model</h2><table id="modelTbl"><thead><tr><th>model</th><th>count</th><th>success%</th><th>avg ms</th></tr></thead><tbody></tbody></table></div>
+  <div class="panel"><h2>Recent calls</h2>
+    <div class="filters">
+      <select id="fModel"><option value="">all models</option></select>
+      <select id="fStatus"><option value="">all status</option><option value="2">2xx</option><option value="4">4xx</option><option value="5">5xx</option></select>
+      <input id="fSearch" placeholder="search reason / user…">
+    </div>
+    <table id="callsTbl"><thead><tr><th>time</th><th>user</th><th>requested</th><th>route</th><th>reason</th><th>ms</th><th>tokens</th><th>status</th></tr></thead><tbody></tbody></table>
+  </div>
+</main>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4" onerror="window.__noChart=true"></script>
+<script>
+const $=s=>document.querySelector(s); let calls=[]; let lineChart, donutChart;
+const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const cls=st=>'s'+Math.floor((st||0)/100)+'xx';
+async function load(){
+  const w=$('#window').value;
+  try{
+    const [stats,trace]=await Promise.all([
+      fetch('/trace/stats?window='+encodeURIComponent(w),{credentials:'same-origin'}).then(r=>{if(!r.ok)throw new Error(r.status);return r.json()}),
+      fetch('/trace?limit=100',{credentials:'same-origin'}).then(r=>r.ok?r.json():{rows:[]})
+    ]);
+    $('#banner').innerHTML='';
+    render(stats); calls=trace.rows||[]; populateModelFilter(); renderCalls();
+  }catch(e){ $('#banner').innerHTML='<div class="note">trace DB unavailable ('+esc(e.message)+')</div>'; }
+}
+function card(k,v){return '<div class="card"><div class="k">'+k+'</div><div class="v">'+v+'</div></div>';}
+function render(s){
+  const t=s.totals;
+  $('#scope').textContent='window: '+s.window;
+  $('#cards').innerHTML=[card('Requests',t.requests),card('Error rate',(t.error_rate*100).toFixed(1)+'%'),
+    card('Avg latency',t.avg_latency_ms+' ms'),card('p95 latency',t.p95_latency_ms+' ms'),
+    card('Tokens',t.total_tokens),card('Models',t.models)].join('');
+  $('#modelTbl tbody').innerHTML=s.by_model.map(m=>'<tr><td>'+esc(m.model)+'</td><td>'+m.count+'</td><td>'+(m.success_rate*100).toFixed(0)+'%</td><td>'+m.avg_latency_ms+'</td></tr>').join('')||'<tr><td colspan=4 class="note">no data</td></tr>';
+  drawCharts(s);
+}
+function drawCharts(s){
+  if(window.__noChart||typeof Chart==='undefined'){
+    $('#lineWrap').innerHTML='<div class="note">charts unavailable offline</div>';
+    $('#donutWrap').innerHTML='<div class="note">charts unavailable offline</div>'; return;
+  }
+  const labels=s.series.map(b=>b.bucket.slice(5,16).replace('T',' '));
+  lineChart&&lineChart.destroy(); donutChart&&donutChart.destroy();
+  lineChart=new Chart($('#line'),{type:'line',data:{labels,datasets:[
+    {label:'ok',data:s.series.map(b=>b.ok),borderColor:'#3fb950',tension:.3},
+    {label:'err',data:s.series.map(b=>b.err),borderColor:'#f85149',tension:.3}]},
+    options:{plugins:{legend:{labels:{color:'#8a90a0'}}},scales:{x:{ticks:{color:'#8a90a0'}},y:{ticks:{color:'#8a90a0'}}}}});
+  donutChart=new Chart($('#donut'),{type:'doughnut',data:{labels:s.by_model.map(m=>m.model),
+    datasets:[{data:s.by_model.map(m=>m.count),backgroundColor:['#58a6ff','#3fb950','#d29922','#f85149','#a371f7','#79c0ff']}]},
+    options:{plugins:{legend:{labels:{color:'#8a90a0'}}}}});
+}
+function populateModelFilter(){
+  const set=[...new Set(calls.map(c=>c.route).filter(Boolean))];
+  $('#fModel').innerHTML='<option value="">all models</option>'+set.map(m=>'<option>'+esc(m)+'</option>').join('');
+}
+function renderCalls(){
+  const fm=$('#fModel').value, fs=$('#fStatus').value, q=$('#fSearch').value.toLowerCase();
+  const rows=calls.filter(c=>(!fm||c.route===fm)&&(!fs||String(Math.floor((c.status||0)/100))===fs)
+    &&(!q||((c.reason||'')+' '+(c.user_email||'')).toLowerCase().includes(q)));
+  $('#callsTbl tbody').innerHTML=rows.map(c=>'<tr><td>'+esc(c.ts).slice(0,19).replace('T',' ')+'</td><td>'+esc(c.user_email)+'</td><td>'+esc(c.model_requested)+'</td><td>'+esc(c.route)+'</td><td>'+esc(c.reason)+'</td><td>'+esc(c.latency_ms)+'</td><td>'+esc(c.total_tokens)+'</td><td class="'+cls(c.status)+'">'+esc(c.status)+'</td></tr>').join('')||'<tr><td colspan=8 class="note">no rows</td></tr>';
+}
+$('#window').onchange=load; $('#refresh').onclick=load;
+$('#fModel').onchange=renderCalls; $('#fStatus').onchange=renderCalls; $('#fSearch').oninput=renderCalls;
+let timer=null;
+$('#auto').onchange=e=>{ if(e.target.checked){timer=setInterval(load,10000)}else{clearInterval(timer)} };
+load();
+</script></body></html>"""
 
 
 @app.get("/v1/models")
