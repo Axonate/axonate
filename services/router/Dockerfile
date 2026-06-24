@@ -1,5 +1,5 @@
 # Axonate router (permanent, production-grade). Sits in front of LiteLLM.
-FROM python:3.11-slim
+FROM python:3.14-slim
 
 WORKDIR /app
 COPY services/router/requirements.txt .
