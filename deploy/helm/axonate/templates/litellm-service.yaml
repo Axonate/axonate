@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "axonate.fullname" . }}-litellm
+  labels:
+    {{- include "axonate.labels" . | nindent 4 }}
+    app.kubernetes.io/component: litellm
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "axonate.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: litellm
+  ports:
+    - name: http
+      port: 4000
+      targetPort: 4000

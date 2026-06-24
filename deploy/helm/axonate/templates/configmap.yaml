@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "axonate.fullname" . }}-litellm-config
+  labels:
+    {{- include "axonate.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    {{- $cfgFile := "files/litellm_config.prod.yaml" }}
+    {{- required (printf "litellm config %s is missing from the chart (run 'make helm-sync-config')" $cfgFile) (.Files.Get $cfgFile) | nindent 4 }}
