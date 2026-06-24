@@ -330,22 +330,119 @@ async def trace_stats(request: Request, window: str = "24h"):
 
 
 @app.get("/trace/view")
-async def trace_view(request: Request, limit: int = 100):
-    """Minimal HTML trace table — audit + cost + debugging in one place (GOLIVE §5)."""
-    data = await trace_json(request, limit)
-    head = "<tr><th>time</th><th>user</th><th>requested</th><th>route</th><th>reason</th><th>ms</th><th>tokens</th><th>cost</th><th>status</th></tr>"
-    body = "".join(
-        f"<tr><td>{r['ts']}</td><td>{r['user_email']}</td><td>{r['model_requested']}</td>"
-        f"<td>{r['route']}</td><td>{r['reason']}</td><td>{r['latency_ms']}</td>"
-        f"<td>{r['total_tokens']}</td><td>{r['cost'] or ''}</td><td>{r['status']}</td></tr>"
-        for r in data["rows"])
-    html = (f"<html><head><title>axonate trace</title><style>"
-            "body{font:13px monospace;padding:1rem}table{border-collapse:collapse}"
-            "td,th{border:1px solid #ccc;padding:3px 8px}th{background:#eee}</style></head>"
-            f"<body><h3>axonate trace ({len(data['rows'])} rows)</h3>"
-            f"<table>{head}{body}</table></body></html>")
+async def trace_view():
+    """Self-contained dashboard: cards + charts + filterable tables (GOLIVE §5).
+    Fetches /trace/stats and /trace client-side. Charts via Chart.js CDN with
+    graceful fallback; all other content works offline."""
     from fastapi.responses import HTMLResponse
-    return HTMLResponse(html)
+    return HTMLResponse(_DASHBOARD_HTML)
+
+
+_DASHBOARD_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
+<title>Axonate trace</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{--bg:#0f1117;--card:#1a1d27;--line:#2a2f3a;--fg:#e6e8ee;--mut:#8a90a0;--ok:#3fb950;--warn:#d29922;--err:#f85149;--accent:#58a6ff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.4 system-ui,sans-serif}
+header{display:flex;align-items:center;gap:1rem;flex-wrap:wrap;padding:1rem 1.25rem;border-bottom:1px solid var(--line)}
+h1{font-size:1.1rem;margin:0}.badge{font-size:.75rem;color:var(--mut);border:1px solid var(--line);border-radius:99px;padding:2px 10px}
+select,button{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:5px 9px;font:inherit}
+main{padding:1.25rem;max-width:1100px;margin:0 auto}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.75rem;margin-bottom:1.25rem}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:.85rem 1rem}
+.card .k{color:var(--mut);font-size:.72rem;text-transform:uppercase;letter-spacing:.04em}
+.card .v{font-size:1.5rem;font-weight:600;margin-top:.2rem}
+.grid2{display:grid;grid-template-columns:2fr 1fr;gap:1rem;margin-bottom:1.25rem}
+@media(max-width:760px){.grid2{grid-template-columns:1fr}}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:1rem}
+.panel h2{font-size:.8rem;color:var(--mut);text-transform:uppercase;margin:0 0 .6rem}
+table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
+th{color:var(--mut);font-weight:600}.s2xx{color:var(--ok)}.s4xx{color:var(--warn)}.s5xx,.s0xx{color:var(--err)}
+.filters{display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.6rem}.filters input{flex:1;min-width:120px;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:5px 9px}
+.note{color:var(--mut);font-size:.8rem;padding:1.5rem;text-align:center}
+</style></head><body>
+<header>
+  <h1>Axonate trace</h1>
+  <span id="scope" class="badge">…</span>
+  <span style="flex:1"></span>
+  <label>window <select id="window"><option>1h</option><option selected>24h</option><option>7d</option><option>all</option></select></label>
+  <label><input type="checkbox" id="auto"> auto-refresh</label>
+  <button id="refresh">refresh</button>
+</header>
+<main>
+  <div id="banner"></div>
+  <div class="cards" id="cards"></div>
+  <div class="grid2">
+    <div class="panel"><h2>Requests over time</h2><div id="lineWrap"><canvas id="line" height="120"></canvas></div></div>
+    <div class="panel"><h2>By model</h2><div id="donutWrap"><canvas id="donut" height="120"></canvas></div></div>
+  </div>
+  <div class="panel" style="margin-bottom:1.25rem"><h2>Per model</h2><table id="modelTbl"><thead><tr><th>model</th><th>count</th><th>success%</th><th>avg ms</th></tr></thead><tbody></tbody></table></div>
+  <div class="panel"><h2>Recent calls</h2>
+    <div class="filters">
+      <select id="fModel"><option value="">all models</option></select>
+      <select id="fStatus"><option value="">all status</option><option value="2">2xx</option><option value="4">4xx</option><option value="5">5xx</option></select>
+      <input id="fSearch" placeholder="search reason / user…">
+    </div>
+    <table id="callsTbl"><thead><tr><th>time</th><th>user</th><th>requested</th><th>route</th><th>reason</th><th>ms</th><th>tokens</th><th>status</th></tr></thead><tbody></tbody></table>
+  </div>
+</main>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4" onerror="window.__noChart=true"></script>
+<script>
+const $=s=>document.querySelector(s); let calls=[]; let lineChart, donutChart;
+const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const cls=st=>'s'+Math.floor((st||0)/100)+'xx';
+async function load(){
+  const w=$('#window').value;
+  try{
+    const [stats,trace]=await Promise.all([
+      fetch('/trace/stats?window='+encodeURIComponent(w),{credentials:'same-origin'}).then(r=>{if(!r.ok)throw new Error(r.status);return r.json()}),
+      fetch('/trace?limit=100',{credentials:'same-origin'}).then(r=>r.ok?r.json():{rows:[]})
+    ]);
+    $('#banner').innerHTML='';
+    render(stats); calls=trace.rows||[]; populateModelFilter(); renderCalls();
+  }catch(e){ $('#banner').innerHTML='<div class="note">trace DB unavailable ('+esc(e.message)+')</div>'; }
+}
+function card(k,v){return '<div class="card"><div class="k">'+k+'</div><div class="v">'+v+'</div></div>';}
+function render(s){
+  const t=s.totals;
+  $('#scope').textContent='window: '+s.window;
+  $('#cards').innerHTML=[card('Requests',t.requests),card('Error rate',(t.error_rate*100).toFixed(1)+'%'),
+    card('Avg latency',t.avg_latency_ms+' ms'),card('p95 latency',t.p95_latency_ms+' ms'),
+    card('Tokens',t.total_tokens),card('Models',t.models)].join('');
+  $('#modelTbl tbody').innerHTML=s.by_model.map(m=>'<tr><td>'+esc(m.model)+'</td><td>'+m.count+'</td><td>'+(m.success_rate*100).toFixed(0)+'%</td><td>'+m.avg_latency_ms+'</td></tr>').join('')||'<tr><td colspan=4 class="note">no data</td></tr>';
+  drawCharts(s);
+}
+function drawCharts(s){
+  if(window.__noChart||typeof Chart==='undefined'){
+    $('#lineWrap').innerHTML='<div class="note">charts unavailable offline</div>';
+    $('#donutWrap').innerHTML='<div class="note">charts unavailable offline</div>'; return;
+  }
+  const labels=s.series.map(b=>b.bucket.slice(11,16));
+  lineChart&&lineChart.destroy(); donutChart&&donutChart.destroy();
+  lineChart=new Chart($('#line'),{type:'line',data:{labels,datasets:[
+    {label:'ok',data:s.series.map(b=>b.ok),borderColor:'#3fb950',tension:.3},
+    {label:'err',data:s.series.map(b=>b.err),borderColor:'#f85149',tension:.3}]},
+    options:{plugins:{legend:{labels:{color:'#8a90a0'}}},scales:{x:{ticks:{color:'#8a90a0'}},y:{ticks:{color:'#8a90a0'}}}}});
+  donutChart=new Chart($('#donut'),{type:'doughnut',data:{labels:s.by_model.map(m=>m.model),
+    datasets:[{data:s.by_model.map(m=>m.count),backgroundColor:['#58a6ff','#3fb950','#d29922','#f85149','#a371f7','#79c0ff']}]},
+    options:{plugins:{legend:{labels:{color:'#8a90a0'}}}}});
+}
+function populateModelFilter(){
+  const set=[...new Set(calls.map(c=>c.route).filter(Boolean))];
+  $('#fModel').innerHTML='<option value="">all models</option>'+set.map(m=>'<option>'+esc(m)+'</option>').join('');
+}
+function renderCalls(){
+  const fm=$('#fModel').value, fs=$('#fStatus').value, q=$('#fSearch').value.toLowerCase();
+  const rows=calls.filter(c=>(!fm||c.route===fm)&&(!fs||String(Math.floor((c.status||0)/100))===fs)
+    &&(!q||((c.reason||'')+' '+(c.user_email||'')).toLowerCase().includes(q)));
+  $('#callsTbl tbody').innerHTML=rows.map(c=>'<tr><td>'+esc(c.ts).slice(0,19).replace('T',' ')+'</td><td>'+esc(c.user_email)+'</td><td>'+esc(c.model_requested)+'</td><td>'+esc(c.route)+'</td><td>'+esc(c.reason)+'</td><td>'+esc(c.latency_ms)+'</td><td>'+esc(c.total_tokens)+'</td><td class="'+cls(c.status)+'">'+esc(c.status)+'</td></tr>').join('')||'<tr><td colspan=8 class="note">no rows</td></tr>';
+}
+$('#window').onchange=load; $('#refresh').onclick=load;
+$('#fModel').onchange=renderCalls; $('#fStatus').onchange=renderCalls; $('#fSearch').oninput=renderCalls;
+let timer=null;
+$('#auto').onchange=e=>{ if(e.target.checked){timer=setInterval(load,10000)}else{clearInterval(timer)} };
+load();
+</script></body></html>"""
 
 
 @app.get("/v1/models")
