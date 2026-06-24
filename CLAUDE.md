@@ -95,6 +95,9 @@ services/
 clients/ax                  # thin CLI
 docker-compose.yml          # poc / prod profiles
 config/poc.env.example  config/prod.env.example
+.devcontainer/              # tools-only dev env (host Docker socket) — see below
+deploy/helm/axonate/        # prod-track Helm chart (permanent services only)
+.github/workflows/build-router.yml   # build+push router image to GHCR on v* tags
 ```
 
 ## Commands
@@ -105,10 +108,44 @@ config/poc.env.example  config/prod.env.example
 - `make login-claude ACCT=acctA` / `make login-codex` — in-container CLI OAuth
 - `make add-user EMAIL=.. BUDGET=..` — provision a LiteLLM virtual key
 - `make backup` / `make restore FILE=..` — Postgres dump/restore
+- `make helm-sync-config` — copy `services/litellm/litellm_config.prod.yaml` into the chart's
+  `deploy/helm/axonate/files/` (chart loads it via `.Files.Get`; run after editing the prod config)
 - Unit tests (no Docker): `. .venv/bin/activate && python3 tests/test_routing.py`
+  — needs the `.venv` (router+adapter requirements; bare system python lacks `asyncpg`)
 - Note: LiteLLM's **first** boot runs ~128 DB migrations (several minutes) — wait for
   `http://127.0.0.1:4000/health/liveliness` = 200 before testing. Subsequent boots are fast.
 - LiteLLM usage UI / dashboard: `http://127.0.0.1:4000/ui` (master key).
+
+## Dev environment & Kubernetes deploy
+
+Two deployment substrates exist for the **permanent** services; they are alternatives, not a
+rewrite — same OpenAI-compatible boundaries, same model names.
+
+- **docker-compose** (`docker-compose.yml`) — the POC + single-host prod path. `poc` profile
+  adds the disposable adapter; `prod` adds cloudflared. This is the primary path.
+- **Helm chart** (`deploy/helm/axonate/`) — prod-track Kubernetes path. Ships **only** the
+  permanent services (litellm, router, cloudflared, optional in-cluster Postgres). The CLI
+  adapter is **never** in the chart (disposable / POC-only / ToS single-user). There is **no
+  `configMode=poc`** — the chart always loads the prod litellm config; a poc config in-cluster
+  would be broken (no adapter, no `ADAPTER_TOKEN`). Key invariants carried into the chart:
+  router/litellm Services are `ClusterIP` (no open ports); cloudflared tunnel is the default
+  ingress path (standard Ingress is an opt-in values toggle); one k8s Secret (or `existingSecret`)
+  feeds both services — the `axonate.databaseUrl` helper derives litellm's `DATABASE_URL` from the
+  same `secret.postgres.*` parts the router consumes (single source of truth); litellm probes use
+  a high `failureThreshold` to survive the slow first-boot migrations. Validate with
+  `helm lint deploy/helm/axonate` + `helm template`. See `deploy/helm/axonate/README.md`.
+
+The **router is the only Axonate-authored image** the chart needs (litellm/cloudflared/postgres
+are public). `.github/workflows/build-router.yml` builds it from `services/router/Dockerfile`
+(build context = repo root, since the Dockerfile COPYs from `services/auth` and `config/`) and
+pushes to `ghcr.io/<owner>/axonate-router` on a `v*` tag or manual dispatch; the run summary
+prints the digest to pin in `image.router.digest`.
+
+**Devcontainer** (`.devcontainer/`) — tools-only container that mounts the **host** Docker socket
+(not Docker-in-Docker), so `make` drives the host compose stack and the OAuth-login volumes
+persist across rebuilds. `postCreateCommand` provisions `.venv` + deps and seeds `.env` (only if
+missing). Claude/Codex CLIs are an off-by-default optional feature; real adapter login still
+happens in the adapter container.
 
 ## Conventions
 
