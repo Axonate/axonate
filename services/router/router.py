@@ -417,7 +417,7 @@ function drawCharts(s){
     $('#lineWrap').innerHTML='<div class="note">charts unavailable offline</div>';
     $('#donutWrap').innerHTML='<div class="note">charts unavailable offline</div>'; return;
   }
-  const labels=s.series.map(b=>b.bucket.slice(11,16));
+  const labels=s.series.map(b=>b.bucket.slice(5,16).replace('T',' '));
   lineChart&&lineChart.destroy(); donutChart&&donutChart.destroy();
   lineChart=new Chart($('#line'),{type:'line',data:{labels,datasets:[
     {label:'ok',data:s.series.map(b=>b.ok),borderColor:'#3fb950',tension:.3},
