@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "axonate.fullname" . }}-router
+  labels:
+    {{- include "axonate.labels" . | nindent 4 }}
+    app.kubernetes.io/component: router
+spec:
+  replicas: {{ .Values.router.replicas }}
+  selector:
+    matchLabels:
+      {{- include "axonate.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: router
+  template:
+    metadata:
+      labels:
+        {{- include "axonate.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: router
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name | default (include "axonate.fullname" .) }}
+      containers:
+        - name: router
+          image: "{{ required "image.router.repository is required" .Values.image.router.repository }}{{ if .Values.image.router.digest }}@{{ .Values.image.router.digest }}{{ else }}:{{ .Values.image.router.tag }}{{ end }}"
+          imagePullPolicy: {{ .Values.image.router.pullPolicy }}
+          env:
+            - name: LITELLM_URL
+              value: "http://{{ include "axonate.fullname" . }}-litellm:4000"
+            - name: AUTH_MODE
+              value: {{ .Values.router.authMode | quote }}
+            - name: ROUTER_DEV_USER
+              value: {{ .Values.router.devUser | quote }}
+            - name: LOG_PROMPTS
+              value: {{ .Values.router.logPrompts | quote }}
+            - name: ROUTER_RATE_LIMIT
+              value: {{ .Values.router.rateLimit | quote }}
+            - name: CF_ACCESS_TEAM_DOMAIN
+              value: {{ .Values.router.cfAccessTeamDomain | quote }}
+            - name: CF_ACCESS_AUD
+              value: {{ .Values.router.cfAccessAud | quote }}
+          envFrom:
+            - secretRef:
+                name: {{ include "axonate.secretName" . }}
+          ports:
+            - name: http
+              containerPort: 4100
+          readinessProbe:
+            httpGet: { path: /health, port: 4100 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: 4100 }
+            initialDelaySeconds: 20
+            periodSeconds: 15
+          resources: {{- toYaml .Values.router.resources | nindent 12 }}
