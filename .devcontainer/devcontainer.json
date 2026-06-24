@@ -7,6 +7,9 @@
       "installDockerComposeSwitch": true
     },
     "ghcr.io/devcontainers/features/github-cli:1": {}
+    // OPTIONAL — uncomment for in-devcontainer Claude/Codex CLI experiments.
+    // Real adapter OAuth login still happens inside the adapter container, NOT here.
+    // , "ghcr.io/devcontainers/features/node:1": { "version": "lts" }
   },
   "mounts": [
     "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"
