@@ -1,0 +1,52 @@
+# Axonate LiteLLM proxy config (POC). The ONLY file that changes at the prod swap:
+# model_list backends flip from adapter/subscription to real APIs; everything else stays.
+# Model NAMES are identical across poc/prod so clients never change.
+
+model_list:
+  # --- claude via the CLI adapter: acctA primary, acctB failover (prioritized) ---
+  - model_name: claude
+    litellm_params:
+      model: openai/claude                 # adapter model id
+      api_base: http://axonate-adapter:8080/v1
+      api_key: os.environ/ADAPTER_TOKEN
+  - model_name: claude-acctB
+    litellm_params:
+      model: openai/claude-acctB
+      api_base: http://axonate-adapter:8080/v1
+      api_key: os.environ/ADAPTER_TOKEN
+
+  # --- codex via the CLI adapter ---
+  - model_name: codex
+    litellm_params:
+      model: openai/codex
+      api_base: http://axonate-adapter:8080/v1
+      api_key: os.environ/ADAPTER_TOKEN
+
+  # --- minimax: subscription key, OpenAI-compatible base (direct, no adapter) ---
+  - model_name: minimax
+    litellm_params:
+      model: openai/MiniMax-M2.5
+      api_base: os.environ/MINIMAX_BASE_URL
+      api_key: os.environ/MINIMAX_API_KEY
+
+litellm_settings:
+  drop_params: true            # silently drop unsupported OpenAI params instead of erroring
+  num_retries: 1
+  # claude acctA exhausted/down -> automatically fail over to acctB (priority, not round-robin)
+  fallbacks:
+    - claude: ["claude-acctB"]
+
+  # GOLIVE §2 [B]: hard GLOBAL spend ceiling across ALL users/keys. Blocks at the limit.
+  max_budget: 100              # USD across the whole proxy per budget_duration. TUNE THIS.
+  budget_duration: 30d
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL      # postgres: virtual keys + spend + budgets
+  store_model_in_db: true
+  # GOLIVE §2 [B]: spend-spike alert + daily spend digest
+  alerting: ["slack"]
+  alerting_threshold: 300      # seconds (slow-response). Real-time budget/outage alerts only.
+  # spend_reports dropped — native format is noisy (leaks httpx user-agent tags).
+  # Clean daily digest comes from scripts/spend_digest.py instead.
+  alert_types: ["budget_alerts", "outage_alerts", "db_exceptions"]
