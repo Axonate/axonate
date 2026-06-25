@@ -303,7 +303,8 @@ def _is_admin_email(email: str) -> bool:
     return email.lower() in ADMIN_EMAILS
 
 
-_key_user: dict = {}   # caller sk-key -> email (in-process cache)
+_key_user: dict = {}   # caller sk-key -> (email, cached_at) (in-process cache)
+_KEY_CACHE_TTL = 60    # seconds; cap revocation latency so revoked keys stop working
 
 
 async def _api_identity(request: Request) -> tuple:
@@ -313,8 +314,9 @@ async def _api_identity(request: Request) -> tuple:
     if not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="missing API key")
     key = auth.split(" ", 1)[1].strip()
-    if key in _key_user:
-        return _key_user[key], key
+    hit = _key_user.get(key)
+    if hit and (time.time() - hit[1]) < _KEY_CACHE_TTL:
+        return hit[0], key
     try:
         async with httpx.AsyncClient(timeout=10) as c:
             r = await c.get(f"{LITELLM_URL}/key/info",
@@ -325,7 +327,7 @@ async def _api_identity(request: Request) -> tuple:
     if r.status_code != 200:
         raise HTTPException(status_code=401, detail="invalid API key")
     email = (r.json().get("info", {}) or {}).get("user_id") or f"key:{key[-6:]}"
-    _key_user[key] = email
+    _key_user[key] = (email, time.time())
     return email, key
 
 
