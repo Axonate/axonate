@@ -58,9 +58,13 @@ _hits: dict[str, deque] = defaultdict(deque)  # user -> recent request timestamp
 
 @app.middleware("http")
 async def _api_path_gate(request: Request, call_next):
-    if _surface(request) == "api" and not request.url.path.startswith("/v1/"):
+    surf = _surface(request)
+    if surf == "api" and not request.url.path.startswith("/v1/"):
         from fastapi.responses import JSONResponse as _JR
         return _JR({"error": "not found on api host"}, status_code=403)
+    if surf == "app" and request.url.path.startswith("/v1/"):
+        from fastapi.responses import JSONResponse as _JR
+        return _JR({"error": "use api.clouddrove.in for the API"}, status_code=403)
     return await call_next(request)
 
 
