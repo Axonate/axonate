@@ -87,9 +87,9 @@ services:
       timeout: 5s
       retries: 10
 
-  # ---- POC ONLY: disposable CLI adapter. Deleted at the prod swap. ----
+  # ---- POC + LAB: subscription CLI adapter. Disposable at a real-API-key swap; kept for lab use. ----
   axonate-adapter:
-    profiles: ["poc"]
+    profiles: ["poc", "lab"]
     build:
       context: services/adapter
       dockerfile: Dockerfile
@@ -122,9 +122,9 @@ services:
       timeout: 5s
       retries: 10
 
-  # ---- PROD: Cloudflare tunnel. No open inbound ports; only this reaches the gateway. ----
+  # ---- PROD + LAB: Cloudflare tunnel. No open inbound ports; only this reaches the gateway. ----
   axonate-cloudflared:
-    profiles: ["prod"]
+    profiles: ["prod", "lab"]
     # GOLIVE §1 [B]: pin by digest at prod setup -> `docker pull cloudflare/cloudflared:VERSION`
     # then replace with cloudflare/cloudflared@sha256:<digest>
     image: cloudflare/cloudflared:2025.6.1
