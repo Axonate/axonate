@@ -32,7 +32,9 @@ import auth_shim
 from auth_shim import AuthError
 
 LITELLM_URL = os.environ.get("LITELLM_URL", "http://axonate-litellm:4000")
+LITELLM_MASTER_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
 ROUTING_FILE = os.environ.get("ROUTING_FILE", "/app/routing.yaml")
+PORTAL_DEFAULT_BUDGET = float(os.environ.get("PORTAL_DEFAULT_BUDGET", "50"))
 LOG_PROMPTS = os.environ.get("LOG_PROMPTS", "false").lower() == "true"
 RATE_LIMIT = int(os.environ.get("ROUTER_RATE_LIMIT", "60"))  # requests/min/user
 REQUEST_TIMEOUT = float(os.environ.get("ROUTER_TIMEOUT", "300"))
@@ -496,6 +498,65 @@ let timer=null;
 $('#auto').onchange=e=>{ if(e.target.checked){timer=setInterval(load,10000)}else{clearInterval(timer)} };
 load();
 </script></body></html>"""
+
+
+async def _litellm_admin(method: str, path: str, **kw):
+    mk = os.environ.get("LITELLM_MASTER_KEY", "")
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            return await c.request(method, f"{LITELLM_URL}{path}",
+                                   headers={"Authorization": f"Bearer {mk}"}, **kw)
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"litellm admin call failed: {e}")
+
+
+async def _portal_email(request: Request) -> str:
+    """Verified Access email for app.* surface, or 401/403."""
+    if _surface(request) != "app":
+        raise HTTPException(status_code=403, detail="portal only on app host")
+    try:
+        email, _ = auth_shim.resolve_identity(request.headers)
+    except AuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    return email.lower()
+
+
+@app.get("/portal/me")
+async def portal_me(request: Request):
+    email = await _portal_email(request)
+    r = await _litellm_admin("GET", "/user/info", params={"user_id": email})
+    if r.status_code == 200:
+        info = r.json()
+        keys = info.get("keys", []) if isinstance(info, dict) else []
+        spend = sum((k.get("spend") or 0) for k in keys) if keys else 0.0
+        budget = next((k.get("max_budget") for k in keys if k.get("max_budget") is not None), None)
+        has_key = bool(keys)
+    else:
+        # user record not yet in LiteLLM DB — check key list directly
+        kl = await _litellm_admin("GET", "/key/list", params={"user_id": email})
+        kl_data = kl.json() if kl.status_code == 200 else {}
+        has_key = bool(kl_data.get("keys"))
+        spend = 0.0
+        budget = None
+    return {"email": email, "is_admin": _is_admin_email(email),
+            "has_key": has_key, "spend": spend, "max_budget": budget}
+
+
+@app.post("/portal/key")
+async def portal_key(request: Request):
+    """Generate or rotate THIS user's key (scoped to the verified Access email)."""
+    email = await _portal_email(request)
+    # revoke existing keys for this user (works even without a user record)
+    kl = await _litellm_admin("GET", "/key/list", params={"user_id": email})
+    if kl.status_code == 200:
+        old = [k for k in (kl.json().get("keys") or []) if k]
+        if old:
+            await _litellm_admin("POST", "/key/delete", json={"keys": old})
+    gen = await _litellm_admin("POST", "/key/generate",
+                               json={"user_id": email, "max_budget": PORTAL_DEFAULT_BUDGET})
+    if gen.status_code != 200:
+        raise HTTPException(status_code=502, detail="key generation failed")
+    return {"key": gen.json().get("key")}
 
 
 @app.get("/v1/models")
