@@ -6,30 +6,38 @@
 
 ## Goal
 
-Expose the lab gateway through two clean, secure public surfaces on `clouddrove.in` (isolated from
-the company prod domain `clouddrove.com`), so household ("lab") users self-onboard with no key
+Expose the lab gateway through three clean, secure public surfaces on `clouddrove.in` (isolated
+from the company prod domain `clouddrove.com`), so household ("lab") users self-onboard with no key
 handouts and no hosted chat:
 
 - **`api.clouddrove.in`** — public OpenAI-compatible API for tools (`ax`, VS Code, laptop chat
   apps). Edge-gated, per-user key auth. No SSO (a CLI can't do interactive login).
 - **`app.clouddrove.in`** — Google-gated web portal. A user logs in, self-serves their API key +
   copy-paste setup, and sees their usage. Admins see everyone + manage keys.
+- **`admin.clouddrove.in`** — the full LiteLLM admin UI, double-gated (Cloudflare Access admin-only
+  + LiteLLM's own login). Deep key/budget/model/log management without SSH.
 
 No hosted chat UI (users run their own client). No real API-key swap (subscription adapter stays —
 private lab use). One Cloudflare tunnel (existing `7778072b`), backend on eva.
 
 ## Surfaces & routing
 
-Both hostnames route through the existing tunnel to `axonate-router:4100`. The router behaves
-differently per surface, keyed on the inbound `Host` header:
+Three public hostnames route through the existing tunnel. `api.*` and `app.*` go to
+`axonate-router:4100` (the router behaves differently per surface, keyed on the inbound `Host`
+header); `admin.*` goes straight to `axonate-litellm:4000`.
 
 | Host | Backend | Edge security | App auth |
 |---|---|---|---|
 | `api.clouddrove.in` | router `/v1/*` only | WAF + rate-limit + **shared CF Access service-token** | per-user `sk-` key (Bearer) → forwarded to LiteLLM |
 | `app.clouddrove.in` | router portal + `/trace*` | **CF Access (Google SSO)** | Access JWT (verified) → email |
+| `admin.clouddrove.in` | LiteLLM admin UI (`:4000/ui`) | **CF Access (Google SSO), admin emails only** | LiteLLM's own login (admin + master key) |
 
 On `api.*`, any path other than `/v1/*` returns 403. On `app.*`, the portal + usage views are
 served and the Access JWT is verified (router already supports `AUTH_MODE=cloudflare`).
+`admin.*` exposes the full LiteLLM admin UI (keys, budgets, models, raw logs) — **double-gated**:
+Cloudflare Access (Google, admin-only) at the edge, then LiteLLM's own admin login. It bypasses the
+router entirely (tunnel → `axonate-litellm:4000`). LiteLLM's port stays unpublished to the host;
+only the tunnel reaches it.
 
 ## Security model (defense in depth on `api.*`)
 
@@ -82,13 +90,15 @@ schema.
 
 ## Component 3 — Cloudflare config + onboarding (documented, user-side)
 
-`docs/SURFACES.md` (or extend `docs/LAB-DEPLOY.md`): create the two public hostnames on the tunnel
-(`api`/`app` → `axonate-router:4100`); create an **Access application (Google IdP)** on `app.*`
-with a policy allowing the chosen `@clouddrove.com` emails; create an **Access service-token** and
-a service-token policy on `api.*`; set `.env` (`AUTH_MODE=cloudflare`, `CF_ACCESS_TEAM_DOMAIN`,
-`CF_ACCESS_AUD`, `API_HOST`, `APP_HOST`, `ADMIN_EMAILS`, the service-token id/secret for display in
-the portal). Onboarding a person = **add their email to the Access allow-list**; they then open
-`app.clouddrove.in`, Google-login, and self-serve their key + setup.
+`docs/SURFACES.md` (or extend `docs/LAB-DEPLOY.md`): create the three public hostnames on the
+tunnel (`api`/`app` → `axonate-router:4100`, `admin` → `axonate-litellm:4000`); create an **Access
+application (Google IdP)** on `app.*` (policy: chosen `@clouddrove.com` emails) and another on
+`admin.*` (policy: admin emails only); create an **Access service-token** + service-token policy on
+`api.*`; set `.env` (`AUTH_MODE=cloudflare`, `CF_ACCESS_TEAM_DOMAIN`, `CF_ACCESS_AUD`, `API_HOST`,
+`APP_HOST`, `ADMIN_EMAILS`, the service-token id/secret for display in the portal). Onboarding a
+person = **add their email to the Access allow-list**; they then open `app.clouddrove.in`,
+Google-login, and self-serve their key + setup. LiteLLM's `:4000` stays unpublished on the host —
+reachable only via the `admin.*` tunnel route.
 
 ## Data flow
 
@@ -98,6 +108,9 @@ tool → api.clouddrove.in → CF (WAF, rate-limit, service-token check) → tun
 
 user → app.clouddrove.in → CF Access (Google login) → tunnel → router (verify Access JWT → email)
      → portal (mint/fetch key, setup snippets, own/all usage)
+
+admin → admin.clouddrove.in → CF Access (Google, admin-only) → tunnel → litellm :4000/ui
+      → LiteLLM admin login (master key) → full key/budget/model/log management
 ```
 
 ## Error handling / edge cases
@@ -117,7 +130,8 @@ user → app.clouddrove.in → CF Access (Google login) → tunnel → router (v
 - Live E2E on eva: a generated key works via `https://api.clouddrove.in/v1` with the service-token
   headers; the portal at `app.clouddrove.in` mints/rotates a key and shows own usage; an admin sees
   all; an unauthenticated `app.*` request is blocked; an `api.*` request without the service-token
-  is blocked at the edge.
+  is blocked at the edge; `admin.clouddrove.in` reaches the LiteLLM UI only after Cloudflare Access
+  (admin email) + LiteLLM login, and a non-admin email is denied by the Access policy.
 
 ## Non-goals (separate / future)
 
@@ -130,5 +144,8 @@ user → app.clouddrove.in → CF Access (Google login) → tunnel → router (v
 
 - Domain `clouddrove.in` (isolated from company prod `clouddrove.com`); login still restricted to
   `@clouddrove.com` via the Access policy — host and login domain are independent.
-- Two surfaces (`api` public+key+edge-token, `app` Google portal) chosen over a hosted chat UI and
-  over per-user service tokens, to minimize hosting + admin overhead for a small private lab.
+- Three surfaces (`api` public+key+edge-token, `app` Google portal, `admin` Access-gated LiteLLM
+  UI) chosen over a hosted chat UI and over per-user service tokens, to minimize hosting + admin
+  overhead for a small private lab. `admin.*` exposes the powerful LiteLLM UI but is double-gated
+  (Cloudflare Access admin-only + LiteLLM's own login); the alternative (SSH port-forward to
+  `:4000`) was rejected for convenience.
