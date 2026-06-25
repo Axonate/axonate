@@ -41,6 +41,7 @@ REQUEST_TIMEOUT = float(os.environ.get("ROUTER_TIMEOUT", "300"))
 API_HOST = os.environ.get("API_HOST", "api.clouddrove.in").lower()
 APP_HOST = os.environ.get("APP_HOST", "app.clouddrove.in").lower()
 ADMIN_EMAILS = {e.strip().lower() for e in os.environ.get("ADMIN_EMAILS", "").split(",") if e.strip()}
+SERVICE_TOKEN_ID = os.environ.get("SERVICE_TOKEN_ID", "")
 
 PG = {
     "host": os.environ.get("POSTGRES_HOST", "axonate-db"),
@@ -547,7 +548,8 @@ async def portal_me(request: Request):
         spend = 0.0
         budget = None
     return {"email": email, "is_admin": _is_admin_email(email),
-            "has_key": has_key, "spend": spend, "max_budget": budget}
+            "has_key": has_key, "spend": spend, "max_budget": budget,
+            "service_token_id": SERVICE_TOKEN_ID}
 
 
 @app.get("/portal")
@@ -584,6 +586,7 @@ a{color:#58a6ff}.warn{color:#d29922}
 
 <div class="card">
   <div class="k">SETUP — base URL <code>https://api.clouddrove.in/v1</code></div>
+  <div class="k" style="margin-bottom:.4rem">api.clouddrove.in also requires the Cloudflare service-token headers below; get the Client Secret from your admin.</div>
   <div id="setup" class="k">Generate a key to see ready-to-paste setup.</div>
 </div>
 
@@ -595,10 +598,12 @@ a{color:#58a6ff}.warn{color:#d29922}
 <script>
 const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let SVC = '';
 async function me(){
   const r=await fetch('/portal/me',{credentials:'same-origin'});
   if(!r.ok){$('#who').textContent='not authenticated';return;}
   const d=await r.json();
+  SVC = d.service_token_id || '';
   $('#who').textContent=d.email+(d.is_admin?' (admin)':'');
   if(d.has_key){
     $('#keyState').innerHTML='You have a key. Spend: $'+(d.spend||0).toFixed(2)+(d.max_budget!=null?(' / $'+d.max_budget):'');
@@ -609,11 +614,23 @@ async function me(){
 }
 function snippets(key){
   const base='https://api.clouddrove.in/v1';
-  return 'ax CLI:\n'+
+  const svcId=esc(SVC)||'YOUR_SERVICE_TOKEN_ID';
+  return 'NOTE: api.clouddrove.in also requires Cloudflare service-token headers;\n'+
+    'get the Client Secret from your admin.\n\n'+
+    'curl example:\n'+
+    '  curl '+base+'/chat/completions \\\n'+
+    '    -H "Authorization: Bearer '+key+'" \\\n'+
+    '    -H "CF-Access-Client-Id: '+svcId+'" \\\n'+
+    '    -H "CF-Access-Client-Secret: <ask admin>" \\\n'+
+    '    -d \'{"model":"auto","messages":[{"role":"user","content":"hi"}]}\'\n\n'+
+    'ax CLI:\n'+
     '  export AXONATE_URL=https://api.clouddrove.in\n'+
     '  export AXONATE_KEY='+key+'\n\n'+
     'VS Code (Continue/Cline) — OpenAI-compatible provider:\n'+
-    '  apiBase: '+base+'\n  apiKey:  '+key+'\n  model:   claude   (or codex, auto)\n\n'+
+    '  apiBase: '+base+'\n  apiKey:  '+key+'\n  model:   claude   (or codex, auto)\n'+
+    '  requestOptions.headers:\n'+
+    '    CF-Access-Client-Id: '+svcId+'\n'+
+    '    CF-Access-Client-Secret: <ask admin>\n\n'+
     'Chat app (Open WebUI / Jan) — OpenAI connection:\n'+
     '  Base URL: '+base+'\n  API key:  '+key+'\n  Model:    claude / codex / auto';
 }

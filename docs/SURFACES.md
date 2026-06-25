@@ -23,9 +23,12 @@ Each save auto-creates the DNS record.
 
 - **app**: self-hosted Access app for `app.clouddrove.in`, identity provider Google, policy =
   allow the chosen `@clouddrove.com` emails. Copy the app **AUD** → `.env CF_ACCESS_AUD`.
+  The router verifies this JWT on `app.*` requests; `CF_ACCESS_AUD` covers only this app.
 - **admin**: self-hosted Access app for `admin.clouddrove.in`, Google, policy = admin emails only.
+  The `admin.*` gate is enforced entirely by Cloudflare-side policy — the router does not
+  verify the JWT for admin traffic (it never sees it; LiteLLM sits behind that hostname).
 - Team domain (Zero Trust → Settings) → `.env CF_ACCESS_TEAM_DOMAIN`.
-- `.env`: `AUTH_MODE=cloudflare`. (The router verifies the Access JWT on `app.*`.)
+- `.env`: `AUTH_MODE=cloudflare`.
 
 ## 3. Service token for the API
 
@@ -34,6 +37,11 @@ add a policy of type **Service Auth** allowing that token (alongside/instead of 
 Put the **Client ID** in `.env SERVICE_TOKEN_ID` (shown in the portal); distribute the **Client
 Secret** to users out-of-band. Tools send both as `CF-Access-Client-Id` / `CF-Access-Client-Secret`
 headers.
+
+**Client compatibility:** every tool that calls `api.clouddrove.in` must attach both CF headers on
+every request. curl, the OpenAI Python SDK (`default_headers=`), and VS Code Continue
+(`requestOptions.headers`) all support this. The current `ax` CLI does not yet set custom headers
+and will be blocked at the edge until that is added — a known follow-up.
 
 ## 4. Router env (`.env`)
 

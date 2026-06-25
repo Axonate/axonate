@@ -10,7 +10,7 @@ help:  ## list targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 	  awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 
-up:  ## start the stack (PROFILE=poc|prod)
+up:  ## start the stack (PROFILE=poc|lab|prod)
 	$(COMPOSE) up -d --build
 
 down:  ## stop the stack (keeps volumes/logins)
