@@ -36,6 +36,9 @@ ROUTING_FILE = os.environ.get("ROUTING_FILE", "/app/routing.yaml")
 LOG_PROMPTS = os.environ.get("LOG_PROMPTS", "false").lower() == "true"
 RATE_LIMIT = int(os.environ.get("ROUTER_RATE_LIMIT", "60"))  # requests/min/user
 REQUEST_TIMEOUT = float(os.environ.get("ROUTER_TIMEOUT", "300"))
+API_HOST = os.environ.get("API_HOST", "api.clouddrove.in").lower()
+APP_HOST = os.environ.get("APP_HOST", "app.clouddrove.in").lower()
+ADMIN_EMAILS = {e.strip().lower() for e in os.environ.get("ADMIN_EMAILS", "").split(",") if e.strip()}
 
 PG = {
     "host": os.environ.get("POSTGRES_HOST", "axonate-db"),
@@ -276,6 +279,20 @@ def _is_admin(request: Request) -> bool:
     auth = request.headers.get("authorization", "")
     mk = os.environ.get("LITELLM_MASTER_KEY", "")
     return bool(mk) and auth == f"Bearer {mk}"
+
+
+def _surface(request: Request) -> str:
+    """Which public surface served this request, by Host header."""
+    host = request.headers.get("host", "").split(":")[0].lower()
+    if host == API_HOST:
+        return "api"
+    if host == APP_HOST:
+        return "app"
+    return "other"
+
+
+def _is_admin_email(email: str) -> bool:
+    return email.lower() in ADMIN_EMAILS
 
 
 @app.get("/trace")
