@@ -53,6 +53,14 @@ _pool: asyncpg.Pool | None = None
 _hits: dict[str, deque] = defaultdict(deque)  # user -> recent request timestamps
 
 
+@app.middleware("http")
+async def _api_path_gate(request: Request, call_next):
+    if _surface(request) == "api" and not request.url.path.startswith("/v1/"):
+        from fastapi.responses import JSONResponse as _JR
+        return _JR({"error": "not found on api host"}, status_code=403)
+    return await call_next(request)
+
+
 # ---------- routing decision ----------
 
 def _decide(prompt: str, policy: dict) -> tuple[str, str]:
@@ -295,6 +303,32 @@ def _is_admin_email(email: str) -> bool:
     return email.lower() in ADMIN_EMAILS
 
 
+_key_user: dict = {}   # caller sk-key -> email (in-process cache)
+
+
+async def _api_identity(request: Request) -> tuple:
+    """api.* surface: the caller's own LiteLLM key is the identity.
+    Validate it via LiteLLM /key/info and return (email, key). 401 if invalid."""
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="missing API key")
+    key = auth.split(" ", 1)[1].strip()
+    if key in _key_user:
+        return _key_user[key], key
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(f"{LITELLM_URL}/key/info",
+                            params={"key": key},
+                            headers={"Authorization": f"Bearer {os.environ.get('LITELLM_MASTER_KEY','')}"})
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"key validation failed: {e}")
+    if r.status_code != 200:
+        raise HTTPException(status_code=401, detail="invalid API key")
+    email = (r.json().get("info", {}) or {}).get("user_id") or f"key:{key[-6:]}"
+    _key_user[key] = email
+    return email, key
+
+
 @app.get("/trace")
 async def trace_json(request: Request, limit: int = 100):
     """Read-only trace rows. Admin (master key) sees all; otherwise own rows only."""
@@ -465,7 +499,10 @@ load();
 @app.get("/v1/models")
 async def models(request: Request):
     try:
-        _, key = auth_shim.resolve_identity(request.headers)
+        if _surface(request) == "api":
+            _, key = await _api_identity(request)
+        else:
+            _, key = auth_shim.resolve_identity(request.headers)
     except AuthError as e:
         raise HTTPException(status_code=401, detail=str(e))
     async with httpx.AsyncClient(timeout=30) as c:
@@ -475,9 +512,12 @@ async def models(request: Request):
 
 @app.post("/v1/chat/completions")
 async def chat(request: Request):
-    # 1. identity
+    # 1. identity — api.* uses the caller's own key; otherwise resolve via auth_shim
     try:
-        user, key = auth_shim.resolve_identity(request.headers)
+        if _surface(request) == "api":
+            user, key = await _api_identity(request)
+        else:
+            user, key = auth_shim.resolve_identity(request.headers)
     except AuthError as e:
         raise HTTPException(status_code=401, detail=str(e))
 
