@@ -63,6 +63,14 @@ async def _api_path_gate(request: Request, call_next):
     return await call_next(request)
 
 
+@app.get("/")
+async def root(request: Request):
+    from fastapi.responses import HTMLResponse, JSONResponse as _JR
+    if _surface(request) == "app":
+        return HTMLResponse(_PORTAL_HTML)
+    return _JR({"service": "axonate-router", "ok": True})
+
+
 # ---------- routing decision ----------
 
 def _decide(prompt: str, policy: dict) -> tuple[str, str]:
@@ -540,6 +548,87 @@ async def portal_me(request: Request):
         budget = None
     return {"email": email, "is_admin": _is_admin_email(email),
             "has_key": has_key, "spend": spend, "max_budget": budget}
+
+
+@app.get("/portal")
+async def portal_page(request: Request):
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(_PORTAL_HTML)
+
+
+_PORTAL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
+<title>Axonate — your access</title><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body{margin:0;background:#0f1117;color:#e6e8ee;font:14px/1.5 system-ui,sans-serif}
+main{max-width:760px;margin:0 auto;padding:1.5rem}
+h1{font-size:1.2rem}.card{background:#1a1d27;border:1px solid #2a2f3a;border-radius:10px;padding:1rem;margin:1rem 0}
+button{background:#238636;color:#fff;border:0;border-radius:6px;padding:8px 14px;font:inherit;cursor:pointer}
+button.sec{background:#30363d}
+code,pre{background:#0d1117;border:1px solid #2a2f3a;border-radius:6px;padding:.4rem .6rem;display:block;white-space:pre-wrap;word-break:break-all;font-family:ui-monospace,monospace;font-size:12.5px}
+.k{color:#8a90a0;font-size:.8rem}.row{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}
+a{color:#58a6ff}.warn{color:#d29922}
+</style></head><body><main>
+<h1>Axonate — your access</h1>
+<div id="who" class="k">…</div>
+
+<div class="card">
+  <div class="k">YOUR API KEY</div>
+  <div id="keyState">…</div>
+  <div class="row" style="margin-top:.6rem">
+    <button id="gen">Generate my key</button>
+    <button id="rot" class="sec" style="display:none">Rotate key</button>
+  </div>
+  <p class="warn" id="once" style="display:none">Shown once — copy it now. We can't show it again (use Rotate if lost).</p>
+  <pre id="keyOut" style="display:none"></pre>
+</div>
+
+<div class="card">
+  <div class="k">SETUP — base URL <code>https://api.clouddrove.in/v1</code></div>
+  <div id="setup" class="k">Generate a key to see ready-to-paste setup.</div>
+</div>
+
+<div class="card">
+  <div class="k">YOUR USAGE</div>
+  <p><a href="/trace/view">Open usage dashboard →</a></p>
+</div>
+</main>
+<script>
+const $=s=>document.querySelector(s);
+const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+async function me(){
+  const r=await fetch('/portal/me',{credentials:'same-origin'});
+  if(!r.ok){$('#who').textContent='not authenticated';return;}
+  const d=await r.json();
+  $('#who').textContent=d.email+(d.is_admin?' (admin)':'');
+  if(d.has_key){
+    $('#keyState').innerHTML='You have a key. Spend: $'+(d.spend||0).toFixed(2)+(d.max_budget!=null?(' / $'+d.max_budget):'');
+    $('#gen').style.display='none';$('#rot').style.display='';
+  }else{
+    $('#keyState').textContent='No key yet.';
+  }
+}
+function snippets(key){
+  const base='https://api.clouddrove.in/v1';
+  return 'ax CLI:\n'+
+    '  export AXONATE_URL=https://api.clouddrove.in\n'+
+    '  export AXONATE_KEY='+key+'\n\n'+
+    'VS Code (Continue/Cline) — OpenAI-compatible provider:\n'+
+    '  apiBase: '+base+'\n  apiKey:  '+key+'\n  model:   claude   (or codex, auto)\n\n'+
+    'Chat app (Open WebUI / Jan) — OpenAI connection:\n'+
+    '  Base URL: '+base+'\n  API key:  '+key+'\n  Model:    claude / codex / auto';
+}
+async function gen(){
+  const r=await fetch('/portal/key',{method:'POST',credentials:'same-origin'});
+  if(!r.ok){alert('failed to generate key');return;}
+  const d=await r.json();
+  $('#keyOut').style.display='';$('#once').style.display='';
+  $('#keyOut').textContent=d.key;
+  $('#setup').innerHTML='<pre>'+esc(snippets(d.key))+'</pre>';
+  me();
+}
+$('#gen').onclick=gen; $('#rot').onclick=()=>{ if(confirm('Rotate? Your old key stops working.')) gen(); };
+me();
+</script></body></html>"""
 
 
 @app.post("/portal/key")
