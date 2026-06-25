@@ -32,10 +32,16 @@ import auth_shim
 from auth_shim import AuthError
 
 LITELLM_URL = os.environ.get("LITELLM_URL", "http://axonate-litellm:4000")
+LITELLM_MASTER_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
 ROUTING_FILE = os.environ.get("ROUTING_FILE", "/app/routing.yaml")
+PORTAL_DEFAULT_BUDGET = float(os.environ.get("PORTAL_DEFAULT_BUDGET", "50"))
 LOG_PROMPTS = os.environ.get("LOG_PROMPTS", "false").lower() == "true"
 RATE_LIMIT = int(os.environ.get("ROUTER_RATE_LIMIT", "60"))  # requests/min/user
 REQUEST_TIMEOUT = float(os.environ.get("ROUTER_TIMEOUT", "300"))
+API_HOST = os.environ.get("API_HOST", "api.clouddrove.in").lower()
+APP_HOST = os.environ.get("APP_HOST", "app.clouddrove.in").lower()
+ADMIN_EMAILS = {e.strip().lower() for e in os.environ.get("ADMIN_EMAILS", "").split(",") if e.strip()}
+SERVICE_TOKEN_ID = os.environ.get("SERVICE_TOKEN_ID", "")
 
 PG = {
     "host": os.environ.get("POSTGRES_HOST", "axonate-db"),
@@ -48,6 +54,26 @@ app = FastAPI(title="axonate-router", version="0.1.0")
 _policy: dict = {}
 _pool: asyncpg.Pool | None = None
 _hits: dict[str, deque] = defaultdict(deque)  # user -> recent request timestamps
+
+
+@app.middleware("http")
+async def _api_path_gate(request: Request, call_next):
+    surf = _surface(request)
+    if surf == "api" and not request.url.path.startswith("/v1/"):
+        from fastapi.responses import JSONResponse as _JR
+        return _JR({"error": "not found on api host"}, status_code=403)
+    if surf == "app" and request.url.path.startswith("/v1/"):
+        from fastapi.responses import JSONResponse as _JR
+        return _JR({"error": "use api.clouddrove.in for the API"}, status_code=403)
+    return await call_next(request)
+
+
+@app.get("/")
+async def root(request: Request):
+    from fastapi.responses import HTMLResponse, JSONResponse as _JR
+    if _surface(request) == "app":
+        return HTMLResponse(_PORTAL_HTML)
+    return _JR({"service": "axonate-router", "ok": True})
 
 
 # ---------- routing decision ----------
@@ -278,6 +304,48 @@ def _is_admin(request: Request) -> bool:
     return bool(mk) and auth == f"Bearer {mk}"
 
 
+def _surface(request: Request) -> str:
+    """Which public surface served this request, by Host header."""
+    host = request.headers.get("host", "").split(":")[0].lower()
+    if host == API_HOST:
+        return "api"
+    if host == APP_HOST:
+        return "app"
+    return "other"
+
+
+def _is_admin_email(email: str) -> bool:
+    return email.lower() in ADMIN_EMAILS
+
+
+_key_user: dict = {}   # caller sk-key -> (email, cached_at) (in-process cache)
+_KEY_CACHE_TTL = 60    # seconds; cap revocation latency so revoked keys stop working
+
+
+async def _api_identity(request: Request) -> tuple:
+    """api.* surface: the caller's own LiteLLM key is the identity.
+    Validate it via LiteLLM /key/info and return (email, key). 401 if invalid."""
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="missing API key")
+    key = auth.split(" ", 1)[1].strip()
+    hit = _key_user.get(key)
+    if hit and (time.time() - hit[1]) < _KEY_CACHE_TTL:
+        return hit[0], key
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(f"{LITELLM_URL}/key/info",
+                            params={"key": key},
+                            headers={"Authorization": f"Bearer {os.environ.get('LITELLM_MASTER_KEY','')}"})
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"key validation failed: {e}")
+    if r.status_code != 200:
+        raise HTTPException(status_code=401, detail="invalid API key")
+    email = (r.json().get("info", {}) or {}).get("user_id") or f"key:{key[-6:]}"
+    _key_user[key] = (email, time.time())
+    return email, key
+
+
 @app.get("/trace")
 async def trace_json(request: Request, limit: int = 100):
     """Read-only trace rows. Admin (master key) sees all; otherwise own rows only."""
@@ -445,10 +513,169 @@ load();
 </script></body></html>"""
 
 
+async def _litellm_admin(method: str, path: str, **kw):
+    mk = os.environ.get("LITELLM_MASTER_KEY", "")
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            return await c.request(method, f"{LITELLM_URL}{path}",
+                                   headers={"Authorization": f"Bearer {mk}"}, **kw)
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"litellm admin call failed: {e}")
+
+
+async def _portal_email(request: Request) -> str:
+    """Verified Access email for app.* surface, or 401/403."""
+    if _surface(request) != "app":
+        raise HTTPException(status_code=403, detail="portal only on app host")
+    try:
+        email, _ = auth_shim.resolve_identity(request.headers)
+    except AuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    return email.lower()
+
+
+@app.get("/portal/me")
+async def portal_me(request: Request):
+    email = await _portal_email(request)
+    r = await _litellm_admin("GET", "/user/info", params={"user_id": email})
+    if r.status_code == 200:
+        info = r.json()
+        keys = info.get("keys", []) if isinstance(info, dict) else []
+        spend = sum((k.get("spend") or 0) for k in keys) if keys else 0.0
+        budget = next((k.get("max_budget") for k in keys if k.get("max_budget") is not None), None)
+        has_key = bool(keys)
+    else:
+        # user record not yet in LiteLLM DB — check key list directly
+        kl = await _litellm_admin("GET", "/key/list", params={"user_id": email})
+        kl_data = kl.json() if kl.status_code == 200 else {}
+        has_key = bool(kl_data.get("keys"))
+        spend = 0.0
+        budget = None
+    return {"email": email, "is_admin": _is_admin_email(email),
+            "has_key": has_key, "spend": spend, "max_budget": budget,
+            "service_token_id": SERVICE_TOKEN_ID}
+
+
+@app.get("/portal")
+async def portal_page(request: Request):
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(_PORTAL_HTML)
+
+
+_PORTAL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
+<title>Axonate — your access</title><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body{margin:0;background:#0f1117;color:#e6e8ee;font:14px/1.5 system-ui,sans-serif}
+main{max-width:760px;margin:0 auto;padding:1.5rem}
+h1{font-size:1.2rem}.card{background:#1a1d27;border:1px solid #2a2f3a;border-radius:10px;padding:1rem;margin:1rem 0}
+button{background:#238636;color:#fff;border:0;border-radius:6px;padding:8px 14px;font:inherit;cursor:pointer}
+button.sec{background:#30363d}
+code,pre{background:#0d1117;border:1px solid #2a2f3a;border-radius:6px;padding:.4rem .6rem;display:block;white-space:pre-wrap;word-break:break-all;font-family:ui-monospace,monospace;font-size:12.5px}
+.k{color:#8a90a0;font-size:.8rem}.row{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}
+a{color:#58a6ff}.warn{color:#d29922}
+</style></head><body><main>
+<h1>Axonate — your access</h1>
+<div id="who" class="k">…</div>
+
+<div class="card">
+  <div class="k">YOUR API KEY</div>
+  <div id="keyState">…</div>
+  <div class="row" style="margin-top:.6rem">
+    <button id="gen">Generate my key</button>
+    <button id="rot" class="sec" style="display:none">Rotate key</button>
+  </div>
+  <p class="warn" id="once" style="display:none">Shown once — copy it now. We can't show it again (use Rotate if lost).</p>
+  <pre id="keyOut" style="display:none"></pre>
+</div>
+
+<div class="card">
+  <div class="k">SETUP — base URL <code>https://api.clouddrove.in/v1</code></div>
+  <div class="k" style="margin-bottom:.4rem">api.clouddrove.in also requires the Cloudflare service-token headers below; get the Client Secret from your admin.</div>
+  <div id="setup" class="k">Generate a key to see ready-to-paste setup.</div>
+</div>
+
+<div class="card">
+  <div class="k">YOUR USAGE</div>
+  <p><a href="/trace/view">Open usage dashboard →</a></p>
+</div>
+</main>
+<script>
+const $=s=>document.querySelector(s);
+const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let SVC = '';
+async function me(){
+  const r=await fetch('/portal/me',{credentials:'same-origin'});
+  if(!r.ok){$('#who').textContent='not authenticated';return;}
+  const d=await r.json();
+  SVC = d.service_token_id || '';
+  $('#who').textContent=d.email+(d.is_admin?' (admin)':'');
+  if(d.has_key){
+    $('#keyState').innerHTML='You have a key. Spend: $'+(d.spend||0).toFixed(2)+(d.max_budget!=null?(' / $'+d.max_budget):'');
+    $('#gen').style.display='none';$('#rot').style.display='';
+  }else{
+    $('#keyState').textContent='No key yet.';
+  }
+}
+function snippets(key){
+  const base='https://api.clouddrove.in/v1';
+  const svcId=esc(SVC)||'YOUR_SERVICE_TOKEN_ID';
+  return 'NOTE: api.clouddrove.in also requires Cloudflare service-token headers;\n'+
+    'get the Client Secret from your admin.\n\n'+
+    'curl example:\n'+
+    '  curl '+base+'/chat/completions \\\n'+
+    '    -H "Authorization: Bearer '+key+'" \\\n'+
+    '    -H "CF-Access-Client-Id: '+svcId+'" \\\n'+
+    '    -H "CF-Access-Client-Secret: <ask admin>" \\\n'+
+    '    -d \'{"model":"auto","messages":[{"role":"user","content":"hi"}]}\'\n\n'+
+    'ax CLI:\n'+
+    '  export AXONATE_URL=https://api.clouddrove.in\n'+
+    '  export AXONATE_KEY='+key+'\n\n'+
+    'VS Code (Continue/Cline) — OpenAI-compatible provider:\n'+
+    '  apiBase: '+base+'\n  apiKey:  '+key+'\n  model:   claude   (or codex, auto)\n'+
+    '  requestOptions.headers:\n'+
+    '    CF-Access-Client-Id: '+svcId+'\n'+
+    '    CF-Access-Client-Secret: <ask admin>\n\n'+
+    'Chat app (Open WebUI / Jan) — OpenAI connection:\n'+
+    '  Base URL: '+base+'\n  API key:  '+key+'\n  Model:    claude / codex / auto';
+}
+async function gen(){
+  const r=await fetch('/portal/key',{method:'POST',credentials:'same-origin'});
+  if(!r.ok){alert('failed to generate key');return;}
+  const d=await r.json();
+  $('#keyOut').style.display='';$('#once').style.display='';
+  $('#keyOut').textContent=d.key;
+  $('#setup').innerHTML='<pre>'+esc(snippets(d.key))+'</pre>';
+  me();
+}
+$('#gen').onclick=gen; $('#rot').onclick=()=>{ if(confirm('Rotate? Your old key stops working.')) gen(); };
+me();
+</script></body></html>"""
+
+
+@app.post("/portal/key")
+async def portal_key(request: Request):
+    """Generate or rotate THIS user's key (scoped to the verified Access email)."""
+    email = await _portal_email(request)
+    # revoke existing keys for this user (works even without a user record)
+    kl = await _litellm_admin("GET", "/key/list", params={"user_id": email})
+    if kl.status_code == 200:
+        old = [k for k in (kl.json().get("keys") or []) if k]
+        if old:
+            await _litellm_admin("POST", "/key/delete", json={"keys": old})
+    gen = await _litellm_admin("POST", "/key/generate",
+                               json={"user_id": email, "max_budget": PORTAL_DEFAULT_BUDGET})
+    if gen.status_code != 200:
+        raise HTTPException(status_code=502, detail="key generation failed")
+    return {"key": gen.json().get("key")}
+
+
 @app.get("/v1/models")
 async def models(request: Request):
     try:
-        _, key = auth_shim.resolve_identity(request.headers)
+        if _surface(request) == "api":
+            _, key = await _api_identity(request)
+        else:
+            _, key = auth_shim.resolve_identity(request.headers)
     except AuthError as e:
         raise HTTPException(status_code=401, detail=str(e))
     async with httpx.AsyncClient(timeout=30) as c:
@@ -458,9 +685,12 @@ async def models(request: Request):
 
 @app.post("/v1/chat/completions")
 async def chat(request: Request):
-    # 1. identity
+    # 1. identity — api.* uses the caller's own key; otherwise resolve via auth_shim
     try:
-        user, key = auth_shim.resolve_identity(request.headers)
+        if _surface(request) == "api":
+            user, key = await _api_identity(request)
+        else:
+            user, key = auth_shim.resolve_identity(request.headers)
     except AuthError as e:
         raise HTTPException(status_code=401, detail=str(e))
 
