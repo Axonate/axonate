@@ -629,7 +629,14 @@ function snippets(key){
     '    -d \'{"model":"auto","messages":[{"role":"user","content":"hi"}]}\'\n\n'+
     'ax CLI:\n'+
     '  export AXONATE_URL=https://api.clouddrove.in\n'+
-    '  export AXONATE_KEY='+key+'\n\n'+
+    '  export AXONATE_KEY='+key+'\n'+
+    '  export AXONATE_CF_CLIENT_ID='+svcId+'\n'+
+    '  export AXONATE_CF_CLIENT_SECRET=<ask admin>\n\n'+
+    'Claude Code (Anthropic /v1/messages):\n'+
+    '  export ANTHROPIC_BASE_URL=https://api.clouddrove.in\n'+
+    '  export ANTHROPIC_AUTH_TOKEN='+key+'\n'+
+    '  export ANTHROPIC_CUSTOM_HEADERS="CF-Access-Client-Id: '+svcId+'\\nCF-Access-Client-Secret: <ask admin>"\n'+
+    '  # then set the model to an Axonate name: claude / codex\n\n'+
     'VS Code (Continue/Cline) — OpenAI-compatible provider:\n'+
     '  apiBase: '+base+'\n  apiKey:  '+key+'\n  model:   claude   (or codex, auto)\n'+
     '  requestOptions.headers:\n'+
