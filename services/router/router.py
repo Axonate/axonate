@@ -610,7 +610,7 @@ async function me(){
   SVC = d.service_token_id || '';
   $('#who').textContent=d.email+(d.is_admin?' (admin)':'');
   if(d.has_key){
-    $('#keyState').innerHTML='You have a key. Spend: $'+(d.spend||0).toFixed(2)+(d.max_budget!=null?(' / $'+d.max_budget):'');
+    $('#keyState').innerHTML='You have a key. Spend: $'+Number(d.spend||0).toFixed(2)+(d.max_budget!=null?(' / $'+d.max_budget):'');
     $('#gen').style.display='none';$('#rot').style.display='';
   }else{
     $('#keyState').textContent='No key yet.';
