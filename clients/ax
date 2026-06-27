@@ -10,8 +10,10 @@ Usage:
   ax -s work --new "fresh start"          # reset a session
 
 Config (env or ~/.config/axonate/config):
-  AXONATE_URL   gateway base url (default http://127.0.0.1:4100)
-  AXONATE_KEY   bearer key (virtual key, or master key in dev)
+  AXONATE_URL                gateway base url (default http://127.0.0.1:4100)
+  AXONATE_KEY                bearer key (virtual key, or master key in dev)
+  AXONATE_CF_CLIENT_ID       Cloudflare Access service-token client id (for api.* edge gate)
+  AXONATE_CF_CLIENT_SECRET   Cloudflare Access service-token client secret
 """
 import argparse
 import json
@@ -52,7 +54,21 @@ def load_config():
                     cfg[k.strip()] = v.strip()
     url = os.environ.get("AXONATE_URL", cfg.get("AXONATE_URL", "http://127.0.0.1:4100"))
     key = os.environ.get("AXONATE_KEY", cfg.get("AXONATE_KEY", ""))
-    return url.rstrip("/"), key
+    cf_id = os.environ.get("AXONATE_CF_CLIENT_ID", cfg.get("AXONATE_CF_CLIENT_ID", ""))
+    cf_secret = os.environ.get("AXONATE_CF_CLIENT_SECRET", cfg.get("AXONATE_CF_CLIENT_SECRET", ""))
+    return url.rstrip("/"), key, cf_id, cf_secret
+
+
+def build_headers(key, cf_id="", cf_secret=""):
+    """Request headers. Adds the Cloudflare Access service-token pair only when BOTH
+    cf_id and cf_secret are set (so api.* edge gate passes); backward-compatible otherwise."""
+    h = {"Content-Type": "application/json"}
+    if key:
+        h["Authorization"] = f"Bearer {key}"
+    if cf_id and cf_secret:
+        h["CF-Access-Client-Id"] = cf_id
+        h["CF-Access-Client-Secret"] = cf_secret
+    return h
 
 
 def main():
@@ -64,7 +80,7 @@ def main():
     ap.add_argument("--new", action="store_true", help="reset the session before this turn")
     args = ap.parse_args()
 
-    url, key = load_config()
+    url, key, cf_id, cf_secret = load_config()
     prompt = " ".join(args.prompt)
     if not sys.stdin.isatty():                 # piped stdin -> append
         piped = sys.stdin.read().strip()
@@ -83,8 +99,7 @@ def main():
 
     req = urllib.request.Request(
         f"{url}/v1/chat/completions", data=body,
-        headers={"Content-Type": "application/json",
-                 "Authorization": f"Bearer {key}"} if key else {"Content-Type": "application/json"},
+        headers=build_headers(key, cf_id, cf_secret),
     )
 
     try:
