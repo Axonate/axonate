@@ -610,7 +610,7 @@ async function me(){
   SVC = d.service_token_id || '';
   $('#who').textContent=d.email+(d.is_admin?' (admin)':'');
   if(d.has_key){
-    $('#keyState').innerHTML='You have a key. Spend: $'+(d.spend||0).toFixed(2)+(d.max_budget!=null?(' / $'+d.max_budget):'');
+    $('#keyState').innerHTML='You have a key. Spend: $'+Number(d.spend||0).toFixed(2)+(d.max_budget!=null?(' / $'+d.max_budget):'');
     $('#gen').style.display='none';$('#rot').style.display='';
   }else{
     $('#keyState').textContent='No key yet.';
@@ -629,7 +629,14 @@ function snippets(key){
     '    -d \'{"model":"auto","messages":[{"role":"user","content":"hi"}]}\'\n\n'+
     'ax CLI:\n'+
     '  export AXONATE_URL=https://api.clouddrove.in\n'+
-    '  export AXONATE_KEY='+key+'\n\n'+
+    '  export AXONATE_KEY='+key+'\n'+
+    '  export AXONATE_CF_CLIENT_ID='+svcId+'\n'+
+    '  export AXONATE_CF_CLIENT_SECRET=<ask admin>\n\n'+
+    'Claude Code (Anthropic /v1/messages):\n'+
+    '  export ANTHROPIC_BASE_URL=https://api.clouddrove.in\n'+
+    '  export ANTHROPIC_AUTH_TOKEN='+key+'\n'+
+    '  export ANTHROPIC_CUSTOM_HEADERS="CF-Access-Client-Id: '+svcId+'\\nCF-Access-Client-Secret: <ask admin>"\n'+
+    '  # then set the model to an Axonate name: claude / codex\n\n'+
     'VS Code (Continue/Cline) — OpenAI-compatible provider:\n'+
     '  apiBase: '+base+'\n  apiKey:  '+key+'\n  model:   claude   (or codex, auto)\n'+
     '  requestOptions.headers:\n'+
@@ -742,6 +749,62 @@ async def chat(request: Request):
 
     raise HTTPException(status_code=502,
                         detail=f"all backends failed for '{requested}'. Last error: {last_err}")
+
+
+@app.post("/v1/messages")
+async def messages_passthrough(request: Request):
+    """Anthropic /v1/messages passthrough — lets Claude Code / Anthropic-shaped clients use the
+    gateway. Surface-aware identity (api.* = caller key; else auth_shim); forwards to LiteLLM,
+    which serves the Anthropic format. No `auto` routing here — the client sends a concrete model
+    (set it to an Axonate model name: claude/codex/minimax)."""
+    try:
+        if _surface(request) == "api":
+            user, key = await _api_identity(request)
+        else:
+            user, key = auth_shim.resolve_identity(request.headers)
+    except AuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    if _rate_limited(user):
+        raise HTTPException(status_code=429,
+                            detail=f"rate limit exceeded ({RATE_LIMIT}/min). Try again shortly.")
+    body = await request.json()
+    model = body.get("model", "")
+    stream = bool(body.get("stream"))
+    started = time.time()
+
+    if stream:
+        async def gen():
+            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
+                async with c.stream("POST", f"{LITELLM_URL}/v1/messages",
+                                     json=body, headers={"Authorization": f"Bearer {key}"}) as r:
+                    async for chunk in r.aiter_bytes():
+                        yield chunk
+            latency = int((time.time() - started) * 1000)
+            await _trace({"user": user, "model_requested": model, "route": model,
+                          "reason": "anthropic /v1/messages", "latency_ms": latency,
+                          "pt": 0, "ct": 0, "tt": 0, "cost": None, "status": 200,
+                          "prompt_text": None})
+        resp = StreamingResponse(gen(), media_type="text/event-stream")
+        resp.headers["X-Router-Route"] = model
+        return resp
+
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
+        r = await c.post(f"{LITELLM_URL}/v1/messages", json=body,
+                         headers={"Authorization": f"Bearer {key}"})
+    latency = int((time.time() - started) * 1000)
+    try:
+        j = r.json()
+    except Exception:
+        j = {"error": "non-json upstream response"}
+    usage = j.get("usage", {}) if isinstance(j, dict) else {}
+    pt, ct = usage.get("input_tokens", 0), usage.get("output_tokens", 0)
+    await _trace({"user": user, "model_requested": model, "route": model,
+                  "reason": "anthropic /v1/messages", "latency_ms": latency,
+                  "pt": pt, "ct": ct, "tt": pt + ct, "cost": None,
+                  "status": r.status_code, "prompt_text": None})
+    out = JSONResponse(j, status_code=r.status_code)
+    out.headers["X-Router-Route"] = model
+    return out
 
 
 class _UpstreamError(Exception):

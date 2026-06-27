@@ -110,8 +110,10 @@ Also add each email to the Cloudflare Access policy (step 3.2). Restart the rout
 - **Concurrency:** one shared subscription token serves the lab — keep it a few people / low
   concurrency, and configure the `acctB` failover slot. Private lab use only.
 - **Token expiry:** subscription OAuth tokens expire (not on restart — on timeout). When a model
-  starts failing auth, re-run the step-4 login on the server. (An automatic expiry alert is a
-  planned follow-up.)
+  starts failing auth, re-run the step-4 login on the server. **Automatic alert:** `make
+  check-tokens` (`scripts/check_tokens.py`) probes claude/codex and posts to `SLACK_WEBHOOK_URL`
+  on failure. Cron it on eva, e.g. every 30 min:
+  `*/30 * * * * cd /Users/eva/workspace/axonate && set -a && . ./.env && set +a && make check-tokens`
 - **Restarts:** `make down` then `make up PROFILE=lab` is safe (keeps volumes/logins). Only `-v`
   is destructive.
 - **Backups:** `make backup` dumps Postgres (keys/spend/trace) to `./backups`; `make restore
