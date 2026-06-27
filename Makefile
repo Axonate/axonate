@@ -56,6 +56,9 @@ add-user:  ## provision a LiteLLM virtual key (EMAIL=.. BUDGET=..)
 digest:  ## post the clean daily spend digest to Slack
 	python3 scripts/spend_digest.py
 
+check-tokens:  ## probe subscription models (claude/codex); alert to Slack on expiry. Cron this on eva.
+	python3 scripts/check_tokens.py
+
 backup:  ## dump postgres + config to ./backups
 	./scripts/backup.sh
 
