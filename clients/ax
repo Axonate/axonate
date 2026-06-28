@@ -72,22 +72,83 @@ def build_headers(key, cf_id="", cf_secret=""):
     return h
 
 
+_C = {"dim": "\033[2m", "b": "\033[1m", "cy": "\033[36m", "gr": "\033[32m",
+      "ye": "\033[33m", "z": "\033[0m"}
+
+
+def fetch_models(url, headers):
+    try:
+        req = urllib.request.Request(f"{url}/v1/models", headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return [m["id"] for m in json.loads(r.read()).get("data", [])]
+    except Exception:
+        return []
+
+
+def print_banner(url, key, headers):
+    c = _C
+    models = fetch_models(url, headers)
+    print(f"""{c['b']}{c['cy']}ax{c['z']} — Axonate gateway CLI
+  {c['dim']}gateway{c['z']}  {url}
+  {c['dim']}models {c['z']}  {(', '.join(models)) if models else c['ye'] + '(unreachable — run: ax status)' + c['z']}
+  {c['dim']}key    {c['z']}  {('…' + key[-6:]) if key else c['ye'] + 'MISSING (set AXONATE_KEY)' + c['z']}
+
+{c['b']}usage{c['z']}
+  ax -m claude "explain this error"
+  ax -m codex  "write a regex for emails"
+  git diff | ax -m claude "review this"
+  ax -s work -m claude "remember X"      {c['dim']}# named session, multi-turn{c['z']}
+  ax --no-stream -m codex "..."          {c['dim']}# disable streaming{c['z']}
+
+{c['b']}commands{c['z']}
+  ax models     {c['dim']}list available models{c['z']}
+  ax status     {c['dim']}show gateway/config + reachability{c['z']}""")
+
+
+def cmd_status(url, key, cf_id, headers):
+    c = _C
+    models = fetch_models(url, headers)
+    ok = bool(models)
+    print(f"{c['b']}axonate status{c['z']}")
+    print(f"  gateway : {url}")
+    print(f"  key     : {('…' + key[-6:]) if key else c['ye'] + 'MISSING' + c['z']}")
+    print(f"  cf-token: {'set' if cf_id else 'none'}")
+    print(f"  models  : {', '.join(models) if models else '-'}")
+    print(f"  reach   : {(c['gr'] + 'ok' + c['z']) if ok else c['ye'] + 'unreachable (check key/cf-token/url)' + c['z']}")
+    sys.exit(0 if ok else 1)
+
+
 def main():
-    ap = argparse.ArgumentParser(prog="ax", description="Axonate CLI")
-    ap.add_argument("prompt", nargs="*", help="prompt text")
-    ap.add_argument("-m", "--model", default="auto", help="model (default: auto)")
+    ap = argparse.ArgumentParser(prog="ax", description="Axonate gateway CLI", add_help=True)
+    ap.add_argument("prompt", nargs="*", help="prompt text (or: models | status)")
+    ap.add_argument("-m", "--model", default="claude",
+                    help="model: claude | codex | auto (default: claude)")
     ap.add_argument("--no-stream", action="store_true", help="disable streaming")
     ap.add_argument("-s", "--session", default="", help="session name (persists history)")
     ap.add_argument("--new", action="store_true", help="reset the session before this turn")
     args = ap.parse_args()
 
     url, key, cf_id, cf_secret = load_config()
+    headers = build_headers(key, cf_id, cf_secret)
+
+    # subcommands / banner
+    if args.prompt == ["models"]:
+        ms = fetch_models(url, headers)
+        if not ms:
+            print("no models (gateway unreachable or auth failed) — try: ax status", file=sys.stderr)
+            sys.exit(1)
+        print("\n".join(ms))
+        return
+    if args.prompt == ["status"]:
+        cmd_status(url, key, cf_id, headers)
+
     prompt = " ".join(args.prompt)
     if not sys.stdin.isatty():                 # piped stdin -> append
         piped = sys.stdin.read().strip()
         prompt = f"{prompt}\n\n{piped}" if prompt else piped
     if not prompt:
-        ap.error("no prompt (pass text or pipe stdin)")
+        print_banner(url, key, headers)        # friendly banner instead of a bare error
+        return
 
     stream = not args.no_stream
     history = [] if args.new else load_session(args.session)
@@ -98,10 +159,9 @@ def main():
         "stream": stream,
     }).encode()
 
-    req = urllib.request.Request(
-        f"{url}/v1/chat/completions", data=body,
-        headers=build_headers(key, cf_id, cf_secret),
-    )
+    import time as _t
+    started = _t.time()
+    req = urllib.request.Request(f"{url}/v1/chat/completions", data=body, headers=headers)
 
     try:
         resp = urllib.request.urlopen(req)
@@ -111,15 +171,18 @@ def main():
             detail = json.loads(detail).get("detail", detail)
         except Exception:
             pass
-        print(f"error {e.code}: {detail}", file=sys.stderr)
+        hint = ""
+        if e.code in (401, 403):
+            hint = "  (check AXONATE_KEY + CF service-token — run: ax status)"
+        print(f"{_C['ye']}error {e.code}{_C['z']}: {detail}{hint}", file=sys.stderr)
         sys.exit(1)
     except urllib.error.URLError as e:
         print(f"cannot reach gateway at {url}: {e.reason}", file=sys.stderr)
         sys.exit(1)
 
-    route = resp.headers.get("X-Router-Route")
-    if route:
-        print(f"[route: {route}]", file=sys.stderr)
+    route = resp.headers.get("X-Router-Route") or args.model
+    cache = resp.headers.get("X-Axonate-Cache", "")
+    print(f"{_C['dim']}— {route}{(' · cached' if cache == 'hit' else '')} —{_C['z']}", file=sys.stderr)
 
     reply = ""
     if stream:
@@ -142,6 +205,10 @@ def main():
         data = json.loads(resp.read())
         reply = data["choices"][0]["message"]["content"]
         print(reply)
+
+    # footer: model + elapsed (+ a token count when non-stream gives usage)
+    elapsed = _t.time() - started
+    print(f"{_C['dim']}[{route} · {elapsed:.1f}s]{_C['z']}", file=sys.stderr)
 
     if args.session and reply:
         save_session(args.session, messages + [{"role": "assistant", "content": reply}])
