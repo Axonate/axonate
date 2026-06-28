@@ -56,7 +56,25 @@ def load_config():
     key = os.environ.get("AXONATE_KEY", cfg.get("AXONATE_KEY", ""))
     cf_id = os.environ.get("AXONATE_CF_CLIENT_ID", cfg.get("AXONATE_CF_CLIENT_ID", ""))
     cf_secret = os.environ.get("AXONATE_CF_CLIENT_SECRET", cfg.get("AXONATE_CF_CLIENT_SECRET", ""))
-    return url.rstrip("/"), key, cf_id, cf_secret
+    model = os.environ.get("AXONATE_MODEL", cfg.get("AXONATE_MODEL", "claude"))
+    return url.rstrip("/"), key, cf_id, cf_secret, model
+
+
+def save_config_kv(k, v):
+    """Upsert key=value in ~/.config/axonate/config (preserve other lines)."""
+    os.makedirs(os.path.dirname(CFG), exist_ok=True)
+    lines, found = [], False
+    if os.path.exists(CFG):
+        with open(CFG) as f:
+            for line in f:
+                if line.strip().startswith(f"{k}="):
+                    lines.append(f"{k}={v}\n"); found = True
+                else:
+                    lines.append(line)
+    if not found:
+        lines.append(f"{k}={v}\n")
+    with open(CFG, "w") as f:
+        f.writelines(lines)
 
 
 def build_headers(key, cf_id="", cf_secret=""):
@@ -85,25 +103,26 @@ def fetch_models(url, headers):
         return []
 
 
-def print_banner(url, key, headers):
+def print_banner(url, key, headers, model):
     c = _C
     models = fetch_models(url, headers)
     print(f"""{c['b']}{c['cy']}ax{c['z']} — Axonate gateway CLI
   {c['dim']}gateway{c['z']}  {url}
+  {c['dim']}model  {c['z']}  {c['gr']}{model}{c['z']}  {c['dim']}(default; change: ax switch MODEL){c['z']}
   {c['dim']}models {c['z']}  {(', '.join(models)) if models else c['ye'] + '(unreachable — run: ax status)' + c['z']}
   {c['dim']}key    {c['z']}  {('…' + key[-6:]) if key else c['ye'] + 'MISSING (set AXONATE_KEY)' + c['z']}
 
 {c['b']}usage{c['z']}
-  ax -m claude "explain this error"
-  ax -m codex  "write a regex for emails"
-  git diff | ax -m claude "review this"
-  ax -s work -m claude "remember X"      {c['dim']}# named session, multi-turn{c['z']}
-  ax --no-stream -m codex "..."          {c['dim']}# disable streaming{c['z']}
+  ax "explain this error"                {c['dim']}# uses your default model ({model}){c['z']}
+  ax -m codex "write a regex"            {c['dim']}# override model for one call{c['z']}
+  git diff | ax "review this"            {c['dim']}# pipe stdin{c['z']}
+  ax -s work "remember X"                {c['dim']}# named session, multi-turn{c['z']}
 
 {c['b']}commands{c['z']}
-  ax models     {c['dim']}list available models{c['z']}
-  ax status     {c['dim']}show gateway/config + reachability{c['z']}
-  ax usage      {c['dim']}your spend / budget / requests{c['z']}""")
+  ax switch MODEL  {c['dim']}set the default model (claude | codex | auto){c['z']}
+  ax models        {c['dim']}list available models{c['z']}
+  ax status        {c['dim']}gateway/config + reachability{c['z']}
+  ax usage         {c['dim']}your spend / budget / requests{c['z']}""")
 
 
 def cmd_usage(url, headers):
@@ -125,12 +144,13 @@ def cmd_usage(url, headers):
     sys.exit(0)
 
 
-def cmd_status(url, key, cf_id, headers):
+def cmd_status(url, key, cf_id, headers, model):
     c = _C
     models = fetch_models(url, headers)
     ok = bool(models)
     print(f"{c['b']}axonate status{c['z']}")
     print(f"  gateway : {url}")
+    print(f"  model   : {c['gr']}{model}{c['z']}  {c['dim']}(default){c['z']}")
     print(f"  key     : {('…' + key[-6:]) if key else c['ye'] + 'MISSING' + c['z']}")
     print(f"  cf-token: {'set' if cf_id else 'none'}")
     print(f"  models  : {', '.join(models) if models else '-'}")
@@ -140,16 +160,29 @@ def cmd_status(url, key, cf_id, headers):
 
 def main():
     ap = argparse.ArgumentParser(prog="ax", description="Axonate gateway CLI", add_help=True)
-    ap.add_argument("prompt", nargs="*", help="prompt text (or: models | status)")
-    ap.add_argument("-m", "--model", default="claude",
-                    help="model: claude | codex | auto (default: claude)")
+    ap.add_argument("prompt", nargs="*", help="prompt text (or: models | status | usage | switch MODEL)")
+    ap.add_argument("-m", "--model", default="",
+                    help="model for this call: claude | codex | auto (overrides the saved default)")
     ap.add_argument("--no-stream", action="store_true", help="disable streaming")
     ap.add_argument("-s", "--session", default="", help="session name (persists history)")
     ap.add_argument("--new", action="store_true", help="reset the session before this turn")
     args = ap.parse_args()
 
-    url, key, cf_id, cf_secret = load_config()
+    url, key, cf_id, cf_secret, saved_model = load_config()
     headers = build_headers(key, cf_id, cf_secret)
+
+    # switch the persisted default model:  ax switch codex   (or: ax use codex)
+    if len(args.prompt) == 2 and args.prompt[0] in ("switch", "use"):
+        m = args.prompt[1]
+        avail = fetch_models(url, headers)
+        if avail and m not in avail and m != "auto":
+            print(f"{_C['ye']}'{m}' not in models{_C['z']}: {', '.join(avail)}", file=sys.stderr)
+            sys.exit(1)
+        save_config_kv("AXONATE_MODEL", m)
+        print(f"{_C['gr']}default model -> {m}{_C['z']}  (override per call with -m)")
+        return
+
+    model = args.model or saved_model    # -m overrides the saved default
 
     # subcommands / banner
     if args.prompt == ["models"]:
@@ -160,7 +193,7 @@ def main():
         print("\n".join(ms))
         return
     if args.prompt == ["status"]:
-        cmd_status(url, key, cf_id, headers)
+        cmd_status(url, key, cf_id, headers, model)
     if args.prompt == ["usage"]:
         cmd_usage(url, headers)
 
@@ -169,14 +202,14 @@ def main():
         piped = sys.stdin.read().strip()
         prompt = f"{prompt}\n\n{piped}" if prompt else piped
     if not prompt:
-        print_banner(url, key, headers)        # friendly banner instead of a bare error
+        print_banner(url, key, headers, model)        # friendly banner instead of a bare error
         return
 
     stream = not args.no_stream
     history = [] if args.new else load_session(args.session)
     messages = history + [{"role": "user", "content": prompt}]
     body = json.dumps({
-        "model": args.model,
+        "model": model,
         "messages": messages,
         "stream": stream,
     }).encode()
@@ -202,7 +235,7 @@ def main():
         print(f"cannot reach gateway at {url}: {e.reason}", file=sys.stderr)
         sys.exit(1)
 
-    route = resp.headers.get("X-Router-Route") or args.model
+    route = resp.headers.get("X-Router-Route") or model
     cache = resp.headers.get("X-Axonate-Cache", "")
     print(f"{_C['dim']}— {route}{(' · cached' if cache == 'hit' else '')} —{_C['z']}", file=sys.stderr)
 
