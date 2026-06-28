@@ -40,6 +40,8 @@ PORTAL_DEFAULT_BUDGET = float(os.environ.get("PORTAL_DEFAULT_BUDGET", "50"))
 LOG_PROMPTS = os.environ.get("LOG_PROMPTS", "false").lower() == "true"
 RATE_LIMIT = int(os.environ.get("ROUTER_RATE_LIMIT", "60"))  # requests/min/user
 REQUEST_TIMEOUT = float(os.environ.get("ROUTER_TIMEOUT", "300"))
+# keep-alive heartbeat for streaming so Cloudflare's ~100s proxy timeout doesn't 524 a slow backend
+HEARTBEAT_SECS = float(os.environ.get("ROUTER_HEARTBEAT_SECS", "15"))
 API_HOST = os.environ.get("API_HOST", "api.clouddrove.in").lower()
 APP_HOST = os.environ.get("APP_HOST", "app.clouddrove.in").lower()
 ADMIN_EMAILS = {e.strip().lower() for e in os.environ.get("ADMIN_EMAILS", "").split(",") if e.strip()}
@@ -1212,34 +1214,53 @@ async def _forward_stream(body, key, user, requested, backend, reason, prompt,
     hwin = int(_policy.get("scoring", {}).get("health_window", 20))
 
     async def gen():
+        # Producer reads the (possibly slow) upstream into a queue; the consumer yields a
+        # keep-alive SSE comment immediately + every HEARTBEAT_SECS of silence so Cloudflare's
+        # 100s proxy timeout doesn't 524 while a slow subscription backend buffers its answer.
         ok, status = True, 200
-        parts = []          # accumulate streamed content for the response cache
+        parts = []
+        q: asyncio.Queue = asyncio.Queue()
+
+        async def pump():
+            nonlocal ok, status
+            try:
+                async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
+                    async with c.stream("POST", f"{LITELLM_URL}/v1/chat/completions",
+                                         json=body, headers={"Authorization": f"Bearer {key}"}) as r:
+                        status = r.status_code
+                        if status >= 500:
+                            ok = False
+                        async for chunk in r.aiter_bytes():
+                            await q.put(chunk)
+            except Exception:
+                ok = False
+            finally:
+                await q.put(None)   # sentinel
+
+        task = asyncio.create_task(pump())
+        yield b": keepalive\n\n"     # immediate first byte
         try:
-            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
-                async with c.stream("POST", f"{LITELLM_URL}/v1/chat/completions",
-                                     json=body, headers={"Authorization": f"Bearer {key}"}) as r:
-                    status = r.status_code
-                    if status >= 500:
-                        ok = False
-                    async for chunk in r.aiter_bytes():
-                        if cache_k:
-                            parts.append(_sse_deltas(chunk))
-                        yield chunk
-        except Exception:
-            ok = False
-            raise
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(q.get(), timeout=HEARTBEAT_SECS)
+                except asyncio.TimeoutError:
+                    yield b": keepalive\n\n"
+                    continue
+                if chunk is None:
+                    break
+                if cache_k:
+                    parts.append(_sse_deltas(chunk))
+                yield chunk
         finally:
-            # record the streamed call's outcome so health-based routing works for streams too
+            task.cancel()
             _health_record(backend, ok, int((time.time() - started) * 1000), hwin)
-        # cache the reconstructed completion on a clean stream (so streams populate the cache too)
-        if cache_k and ok and status < 400:
-            cache_set(cache_k, _synth_completion("".join(parts), backend), time.time(),
-                      (ccfg or {}).get("ttl_seconds", 3600), (ccfg or {}).get("max_entries", 1000))
-        latency = int((time.time() - started) * 1000)
-        await _trace({"user": user, "model_requested": requested, "route": backend,
-                      "reason": reason, "latency_ms": latency, "pt": 0, "ct": 0, "tt": 0,
-                      "cost": None, "status": status,
-                      "prompt_text": prompt if LOG_PROMPTS else None})
+            if cache_k and ok and status < 400:
+                cache_set(cache_k, _synth_completion("".join(parts), backend), time.time(),
+                          (ccfg or {}).get("ttl_seconds", 3600), (ccfg or {}).get("max_entries", 1000))
+            await _trace({"user": user, "model_requested": requested, "route": backend,
+                          "reason": reason, "latency_ms": int((time.time() - started) * 1000),
+                          "pt": 0, "ct": 0, "tt": 0, "cost": None, "status": status,
+                          "prompt_text": prompt if LOG_PROMPTS else None})
 
     resp = StreamingResponse(gen(), media_type="text/event-stream")
     resp.headers["X-Router-Route"] = backend

@@ -214,13 +214,31 @@ def main():
         "stream": stream,
     }).encode()
 
+    import itertools as _it
+    import threading as _th
     import time as _t
-    started = _t.time()
-    req = urllib.request.Request(f"{url}/v1/chat/completions", data=body, headers=headers)
 
+    started = _t.time()
+    _stop = _th.Event()
+
+    def _spin():
+        frames = _it.cycle("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+        while not _stop.is_set():
+            sys.stderr.write(f"\r{_C['dim']}{next(frames)} {model}…{_C['z']}")
+            sys.stderr.flush()
+            _t.sleep(0.1)
+        sys.stderr.write("\r" + " " * 24 + "\r")
+        sys.stderr.flush()
+
+    spinner = _th.Thread(target=_spin, daemon=True)
+    if sys.stderr.isatty():
+        spinner.start()
+
+    req = urllib.request.Request(f"{url}/v1/chat/completions", data=body, headers=headers)
     try:
         resp = urllib.request.urlopen(req)
     except urllib.error.HTTPError as e:
+        _stop.set()
         detail = e.read().decode()
         try:
             detail = json.loads(detail).get("detail", detail)
@@ -229,35 +247,50 @@ def main():
         hint = ""
         if e.code in (401, 403):
             hint = "  (check AXONATE_KEY + CF service-token — run: ax status)"
+        elif e.code in (524, 504):
+            hint = "  (backend slow / timed out — try a shorter prompt or -m codex)"
         print(f"{_C['ye']}error {e.code}{_C['z']}: {detail}{hint}", file=sys.stderr)
         sys.exit(1)
     except urllib.error.URLError as e:
+        _stop.set()
         print(f"cannot reach gateway at {url}: {e.reason}", file=sys.stderr)
         sys.exit(1)
 
     route = resp.headers.get("X-Router-Route") or model
     cache = resp.headers.get("X-Axonate-Cache", "")
-    print(f"{_C['dim']}— {route}{(' · cached' if cache == 'hit' else '')} —{_C['z']}", file=sys.stderr)
+
+    def _stop_spinner_once(_done=[False]):
+        if not _done[0]:
+            _stop.set()
+            if spinner.is_alive():
+                spinner.join(timeout=0.3)
+            print(f"{_C['dim']}— {route}{(' · cached' if cache == 'hit' else '')} —{_C['z']}",
+                  file=sys.stderr)
+            _done[0] = True
 
     reply = ""
     if stream:
         for raw in resp:
             line = raw.decode().strip()
-            if not line.startswith("data: "):
+            if not line.startswith("data: "):     # skips ': keepalive' heartbeat comments too
                 continue
             data = line[6:]
             if data == "[DONE]":
                 break
             try:
                 delta = json.loads(data)["choices"][0]["delta"].get("content", "")
+            except (json.JSONDecodeError, KeyError, IndexError):
+                continue
+            if delta:
+                _stop_spinner_once()
                 reply += delta
                 sys.stdout.write(delta)
                 sys.stdout.flush()
-            except (json.JSONDecodeError, KeyError, IndexError):
-                continue
+        _stop_spinner_once()
         print()
     else:
         data = json.loads(resp.read())
+        _stop_spinner_once()
         reply = data["choices"][0]["message"]["content"]
         print(reply)
 
