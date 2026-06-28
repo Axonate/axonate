@@ -62,7 +62,8 @@ def load_config():
 def build_headers(key, cf_id="", cf_secret=""):
     """Request headers. Adds the Cloudflare Access service-token pair only when BOTH
     cf_id and cf_secret are set (so api.* edge gate passes); backward-compatible otherwise."""
-    h = {"Content-Type": "application/json"}
+    # custom User-Agent: urllib's default (Python-urllib/..) trips Cloudflare bot protection (1010)
+    h = {"Content-Type": "application/json", "User-Agent": "axonate-ax/1.0"}
     if key:
         h["Authorization"] = f"Bearer {key}"
     if cf_id and cf_secret:

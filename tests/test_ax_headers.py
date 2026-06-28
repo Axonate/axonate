@@ -9,7 +9,13 @@ ax = SourceFileLoader("ax", _AX).load_module()
 
 def test_no_key_no_cf():
     h = ax.build_headers("")
-    assert h == {"Content-Type": "application/json"}
+    assert h["Content-Type"] == "application/json"
+    assert "Authorization" not in h and "CF-Access-Client-Id" not in h
+
+
+def test_user_agent_set():
+    # must not be urllib's default (Cloudflare bot-blocks Python-urllib -> 1010)
+    assert ax.build_headers("sk-abc")["User-Agent"] == "axonate-ax/1.0"
 
 
 def test_key_only():
