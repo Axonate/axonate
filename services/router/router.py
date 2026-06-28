@@ -940,16 +940,29 @@ async def _forward_once(body: dict, key: str) -> dict:
 async def _forward_stream(body, key, user, requested, backend, reason, prompt):
     started = time.time()
 
+    hwin = int(_policy.get("scoring", {}).get("health_window", 20))
+
     async def gen():
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
-            async with c.stream("POST", f"{LITELLM_URL}/v1/chat/completions",
-                                 json=body, headers={"Authorization": f"Bearer {key}"}) as r:
-                async for chunk in r.aiter_bytes():
-                    yield chunk
+        ok, status = True, 200
+        try:
+            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
+                async with c.stream("POST", f"{LITELLM_URL}/v1/chat/completions",
+                                     json=body, headers={"Authorization": f"Bearer {key}"}) as r:
+                    status = r.status_code
+                    if status >= 500:
+                        ok = False
+                    async for chunk in r.aiter_bytes():
+                        yield chunk
+        except Exception:
+            ok = False
+            raise
+        finally:
+            # record the streamed call's outcome so health-based routing works for streams too
+            _health_record(backend, ok, int((time.time() - started) * 1000), hwin)
         latency = int((time.time() - started) * 1000)
         await _trace({"user": user, "model_requested": requested, "route": backend,
                       "reason": reason, "latency_ms": latency, "pt": 0, "ct": 0, "tt": 0,
-                      "cost": None, "status": 200,
+                      "cost": None, "status": status,
                       "prompt_text": prompt if LOG_PROMPTS else None})
 
     resp = StreamingResponse(gen(), media_type="text/event-stream")
