@@ -18,8 +18,10 @@ Config (env or ~/.config/axonate/config):
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.request
+from pathlib import Path
 
 CFG = os.path.expanduser("~/.config/axonate/config")
 SESS_DIR = os.path.expanduser("~/.config/axonate/sessions")
@@ -33,6 +35,39 @@ DEFAULT_SYSTEM = (
     "output the complete ready-to-run script in a single code block, with at most one short line of "
     "assumptions above it. Be concise."
 )
+
+# appended to the system prompt under --save so ax can reliably extract files the model declares
+SAVE_INSTRUCTION = (
+    "\n\nThe user will SAVE your output to files on disk. Output EVERY file you produce wrapped "
+    "EXACTLY like this, with only the file's raw contents between the markers (no code fences):\n"
+    "<<<FILE relative/path.ext>>>\n<file contents>\n<<<END>>>\n"
+    "Use relative paths, one block per file. Keep any short explanation OUTSIDE the markers."
+)
+_FILE_RE = re.compile(r"<<<FILE\s+(.+?)>>>\n(.*?)\n<<<END>>>", re.DOTALL)
+
+
+def save_files(reply, force):
+    """Parse <<<FILE>>> markers from the reply and write them. Returns count written."""
+    matches = _FILE_RE.findall(reply)
+    if not matches:
+        print(reply)  # model didn't use markers -> just show the answer
+        print(f"{_C['ye']}(no <<<FILE>>> blocks found — nothing saved){_C['z']}", file=sys.stderr)
+        return 0
+    prose = _FILE_RE.sub("", reply).strip()
+    if prose:
+        print(prose)
+    wrote = 0
+    for path, content in matches:
+        p = Path(path.strip())
+        if p.exists() and not force:
+            print(f"{_C['ye']}skip{_C['z']} {p}  (exists — use --force)", file=sys.stderr)
+            continue
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content)
+        print(f"{_C['gr']}✓ wrote{_C['z']} {p}  {_C['dim']}({len(content)} bytes){_C['z']}",
+              file=sys.stderr)
+        wrote += 1
+    return wrote
 
 
 def load_session(name):
@@ -179,6 +214,8 @@ def main():
     ap.add_argument("--new", action="store_true", help="reset the session before this turn")
     ap.add_argument("--system", default=None, help="override the system instruction for this call")
     ap.add_argument("--raw", action="store_true", help="send NO system instruction (model's raw behavior)")
+    ap.add_argument("--save", action="store_true", help="write files the model declares (<<<FILE>>> blocks)")
+    ap.add_argument("--force", action="store_true", help="overwrite existing files when --save")
     args = ap.parse_args()
 
     url, key, cf_id, cf_secret, saved_model, saved_system = load_config()
@@ -221,6 +258,8 @@ def main():
     stream = not args.no_stream
     history = [] if args.new else load_session(args.session)
     system = "" if args.raw else (args.system if args.system is not None else saved_system)
+    if args.save:
+        system = (system + SAVE_INSTRUCTION).strip()
     sysmsg = [{"role": "system", "content": system}] if system else []
     messages = sysmsg + history + [{"role": "user", "content": prompt}]
     body = json.dumps({
@@ -299,15 +338,21 @@ def main():
             if delta:
                 _stop_spinner_once()
                 reply += delta
-                sys.stdout.write(delta)
-                sys.stdout.flush()
+                if not args.save:                  # when saving, buffer + write files at the end
+                    sys.stdout.write(delta)
+                    sys.stdout.flush()
         _stop_spinner_once()
-        print()
+        if not args.save:
+            print()
     else:
         data = json.loads(resp.read())
         _stop_spinner_once()
         reply = data["choices"][0]["message"]["content"]
-        print(reply)
+        if not args.save:
+            print(reply)
+
+    if args.save:
+        save_files(reply, args.force)
 
     # footer: model + elapsed (+ a token count when non-stream gives usage)
     elapsed = _t.time() - started
