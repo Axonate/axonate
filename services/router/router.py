@@ -297,6 +297,86 @@ def _sse_deltas(chunk: bytes) -> str:
     return "".join(out)
 
 
+# ---------- Anthropic <-> OpenAI translation (text + streaming; powers /v1/messages) ----------
+
+def _text_from_content(content) -> str:
+    """Anthropic content (string or list of blocks) -> flattened text (text blocks only)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(b.get("text", "") for b in content
+                       if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+def anthropic_to_openai(body: dict) -> dict:
+    """Anthropic Messages request -> OpenAI chat-completions request (text only)."""
+    msgs = []
+    sysp = body.get("system")
+    if sysp:
+        msgs.append({"role": "system", "content": _text_from_content(sysp)})
+    for m in body.get("messages", []):
+        msgs.append({"role": m.get("role", "user"),
+                     "content": _text_from_content(m.get("content", ""))})
+    out = {"model": body.get("model", ""), "messages": msgs}
+    for k in ("max_tokens", "temperature", "top_p", "stream"):
+        if body.get(k) is not None:
+            out[k] = body[k]
+    if body.get("stop_sequences") is not None:
+        out["stop"] = body["stop_sequences"]
+    return out
+
+
+_STOP_MAP = {"stop": "end_turn", "length": "max_tokens", "content_filter": "end_turn"}
+
+
+def openai_to_anthropic(resp: dict, model: str) -> dict:
+    """OpenAI chat completion -> Anthropic message response (text only)."""
+    choice = (resp.get("choices") or [{}])[0]
+    text = (choice.get("message") or {}).get("content") or ""
+    usage = resp.get("usage") or {}
+    return {"id": "msg_" + str(resp.get("id", "")), "type": "message", "role": "assistant",
+            "model": model, "stop_sequence": None,
+            "content": [{"type": "text", "text": text}],
+            "stop_reason": _STOP_MAP.get(choice.get("finish_reason"), "end_turn"),
+            "usage": {"input_tokens": usage.get("prompt_tokens", 0),
+                      "output_tokens": usage.get("completion_tokens", 0)}}
+
+
+def _ev(event: str, data: dict) -> bytes:
+    """One Anthropic SSE frame: `event: <name>\\ndata: <json>\\n\\n`."""
+    return ("event: " + event + "\ndata: " + json.dumps(data) + "\n\n").encode()
+
+
+def _ev_prefix(model: str):
+    yield _ev("message_start", {"type": "message_start", "message": {
+        "id": "msg_stream", "type": "message", "role": "assistant", "model": model,
+        "content": [], "stop_reason": None, "usage": {"input_tokens": 0, "output_tokens": 0}}})
+    yield _ev("content_block_start", {"type": "content_block_start", "index": 0,
+                                      "content_block": {"type": "text", "text": ""}})
+
+
+def _ev_delta(text: str) -> bytes:
+    return _ev("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                       "delta": {"type": "text_delta", "text": text}})
+
+
+def _ev_suffix(stop_reason: str = "end_turn", output_tokens: int = 0):
+    yield _ev("content_block_stop", {"type": "content_block_stop", "index": 0})
+    yield _ev("message_delta", {"type": "message_delta",
+                                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                                "usage": {"output_tokens": output_tokens}})
+    yield _ev("message_stop", {"type": "message_stop"})
+
+
+def openai_sse_to_anthropic_events(model: str, deltas) -> list:
+    """Pure: full ordered Anthropic SSE frames for a sequence of OpenAI content deltas (tests)."""
+    frames = list(_ev_prefix(model))
+    frames.extend(_ev_delta(d) for d in deltas if d)
+    frames.extend(_ev_suffix())
+    return frames
+
+
 # ---------- spend / quota (cost-quota signal, best-effort) ----------
 
 async def _near_limit(virtual_key: str) -> bool:
@@ -1001,43 +1081,78 @@ async def messages_passthrough(request: Request):
         raise HTTPException(status_code=429,
                             detail=f"rate limit exceeded ({RATE_LIMIT}/min). Try again shortly.")
     body = await request.json()
-    model = body.get("model", "")
+    requested = body.get("model", "")
     stream = bool(body.get("stream"))
+    oai = anthropic_to_openai(body)          # Anthropic -> OpenAI request (text only)
+    prompt = _last_user_text(oai.get("messages", []))
+
+    # route (auto scores; explicit passes through)
+    if requested == "auto":
+        if _policy.get("scoring", {}).get("enabled"):
+            chosen, reason, order = _decide_scored(prompt, False, _policy)
+        else:
+            chosen, reason = _decide(prompt, _policy)
+            order = _fallback_order(chosen, _policy)
+    else:
+        chosen, reason, order = requested, "explicit model", [requested]
+
     started = time.time()
+    hwin = int(_policy.get("scoring", {}).get("health_window", 20))
 
     if stream:
         async def gen():
-            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
-                async with c.stream("POST", f"{LITELLM_URL}/v1/messages",
-                                     json=body, headers={"Authorization": f"Bearer {key}"}) as r:
-                    async for chunk in r.aiter_bytes():
-                        yield chunk
-            latency = int((time.time() - started) * 1000)
-            await _trace({"user": user, "model_requested": model, "route": model,
-                          "reason": "anthropic /v1/messages", "latency_ms": latency,
-                          "pt": 0, "ct": 0, "tt": 0, "cost": None, "status": 200,
-                          "prompt_text": None})
+            ok, status = True, 200
+            for f in _ev_prefix(chosen):
+                yield f
+            try:
+                fwd = dict(oai, model=chosen, stream=True)
+                async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
+                    async with c.stream("POST", f"{LITELLM_URL}/v1/chat/completions",
+                                         json=fwd, headers={"Authorization": f"Bearer {key}"}) as r:
+                        status = r.status_code
+                        if status >= 500:
+                            ok = False
+                        async for chunk in r.aiter_bytes():
+                            text = _sse_deltas(chunk)
+                            if text:
+                                yield _ev_delta(text)
+            except Exception:
+                ok = False
+            finally:
+                _health_record(chosen, ok, int((time.time() - started) * 1000), hwin)
+            for f in _ev_suffix():
+                yield f
+            await _trace({"user": user, "model_requested": requested, "route": chosen,
+                          "reason": "anthropic /v1/messages", "latency_ms": int((time.time() - started) * 1000),
+                          "pt": 0, "ct": 0, "tt": 0, "cost": None, "status": status,
+                          "prompt_text": prompt if LOG_PROMPTS else None})
         resp = StreamingResponse(gen(), media_type="text/event-stream")
-        resp.headers["X-Router-Route"] = model
+        resp.headers["X-Router-Route"] = chosen
         return resp
 
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
-        r = await c.post(f"{LITELLM_URL}/v1/messages", json=body,
-                         headers={"Authorization": f"Bearer {key}"})
-    latency = int((time.time() - started) * 1000)
-    try:
-        j = r.json()
-    except Exception:
-        j = {"error": "non-json upstream response"}
-    usage = j.get("usage", {}) if isinstance(j, dict) else {}
-    pt, ct = usage.get("input_tokens", 0), usage.get("output_tokens", 0)
-    await _trace({"user": user, "model_requested": model, "route": model,
-                  "reason": "anthropic /v1/messages", "latency_ms": latency,
-                  "pt": pt, "ct": ct, "tt": pt + ct, "cost": None,
-                  "status": r.status_code, "prompt_text": None})
-    out = JSONResponse(j, status_code=r.status_code)
-    out.headers["X-Router-Route"] = model
-    return out
+    # non-stream: forward (with fallback) -> translate response back to Anthropic
+    last_err = None
+    for attempt, backend in enumerate(order):
+        t0 = time.time()
+        try:
+            r = await _forward_once(dict(oai, model=backend, stream=False), key)
+            _health_record(backend, r["status"] < 500, int((time.time() - t0) * 1000), hwin)
+            usage = (r["json"] or {}).get("usage", {}) if isinstance(r["json"], dict) else {}
+            await _trace({"user": user, "model_requested": requested, "route": backend,
+                          "reason": "anthropic /v1/messages", "latency_ms": int((time.time() - started) * 1000),
+                          "pt": usage.get("prompt_tokens", 0), "ct": usage.get("completion_tokens", 0),
+                          "tt": usage.get("total_tokens", 0), "cost": r.get("cost"),
+                          "status": r["status"], "prompt_text": prompt if LOG_PROMPTS else None})
+            out = JSONResponse(openai_to_anthropic(r["json"], requested), status_code=r["status"])
+            out.headers["X-Router-Route"] = backend
+            return out
+        except (httpx.HTTPError, _UpstreamError) as e:
+            _health_record(backend, False, int((time.time() - t0) * 1000), hwin)
+            last_err = e
+            continue
+    return JSONResponse({"type": "error",
+                         "error": {"type": "api_error", "message": f"all backends failed: {last_err}"}},
+                        status_code=502)
 
 
 class _UpstreamError(Exception):
