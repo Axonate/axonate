@@ -25,7 +25,10 @@ ADAPTER_TOKEN = os.environ.get("ADAPTER_TOKEN", "")
 TIMEOUT = int(os.environ.get("ADAPTER_TIMEOUT", "300"))
 
 # read-only default flags; write profiles get the *_CODE_FLAGS
-CLAUDE_FLAGS = os.environ.get("CLAUDE_FLAGS", "--permission-mode plan").split()
+# 'default' (not 'plan'): plan mode makes Claude Code present a plan instead of answering, which
+# breaks every chat/code-gen request through the gateway. No workspace is mounted on the read path
+# so it stays effectively read-only; the write path uses CLAUDE_CODE_FLAGS below.
+CLAUDE_FLAGS = os.environ.get("CLAUDE_FLAGS", "--permission-mode default").split()
 CODEX_FLAGS = os.environ.get("CODEX_FLAGS", "--sandbox read-only").split()
 CLAUDE_CODE_FLAGS = os.environ.get("CLAUDE_CODE_FLAGS", "--permission-mode acceptEdits").split()
 CODEX_CODE_FLAGS = os.environ.get("CODEX_CODE_FLAGS", "--sandbox workspace-write").split()
