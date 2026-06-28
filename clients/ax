@@ -1,92 +1,55 @@
 #!/usr/bin/env python3
-"""ax — thin Axonate CLI for the laptop.
+"""ax — Axonate gateway CLI.
 
-Usage:
-  ax "explain this error"                 # model auto
-  ax -m claude "write a haiku"            # pick a model
-  git diff | ax "review this"             # piped stdin (appended to the prompt)
-  ax --no-stream "..."                    # disable streaming
-  ax -s work "remember X"; ax -s work "what did I say?"   # session continuity
-  ax -s work --new "fresh start"          # reset a session
+  ax                         open the interactive chat (REPL)
+  ax "explain this error"    one-shot question
+  ax --save "build X"        write the files the model declares
+  ax setup                   configure gateway/key/token (wizard)
+  ax switch codex            set the default model
+  ax models | status | usage
 
-Config (env or ~/.config/axonate/config):
-  AXONATE_URL                gateway base url (default http://127.0.0.1:4100)
-  AXONATE_KEY                bearer key (virtual key, or master key in dev)
-  AXONATE_CF_CLIENT_ID       Cloudflare Access service-token client id (for api.* edge gate)
-  AXONATE_CF_CLIENT_SECRET   Cloudflare Access service-token client secret
+Config (env or ~/.config/axonate/config): AXONATE_URL, AXONATE_KEY,
+AXONATE_CF_CLIENT_ID, AXONATE_CF_CLIENT_SECRET, AXONATE_MODEL.
 """
 import argparse
+import itertools
 import json
 import os
 import re
 import sys
+import threading
+import time
 import urllib.request
 from pathlib import Path
 
 CFG = os.path.expanduser("~/.config/axonate/config")
 SESS_DIR = os.path.expanduser("~/.config/axonate/sessions")
 
-# one-shot CLI default: answer directly, assume sensible defaults, never ask back (ax isn't interactive)
+# one-shot CLI default: answer directly, assume defaults, never ask back (not interactive)
 DEFAULT_SYSTEM = (
     "You are a non-interactive command-line assistant answering a single shot. The user CANNOT "
-    "reply, so NEVER ask clarifying questions and NEVER offer to do follow-up work. If the request "
-    "is underspecified, pick the most common sensible defaults and proceed. Do NOT write a plan, "
-    "preamble, or 'here is what I'll do' — give the final answer directly. For code requests, "
-    "output the complete ready-to-run script in a single code block, with at most one short line of "
-    "assumptions above it. Be concise."
+    "reply, so NEVER ask clarifying questions and NEVER offer follow-up work. If underspecified, "
+    "pick the most common sensible defaults and proceed. Do NOT write a plan or preamble — give the "
+    "final answer directly. For code, output the complete ready-to-run script in one code block "
+    "with at most one short line of assumptions above it. Be concise."
 )
+# REPL: conversational — the user CAN answer, so follow-up questions are fine.
+REPL_SYSTEM = "You are a helpful assistant in an interactive terminal chat. Be concise and direct."
 
-# appended to the system prompt under --save so ax can reliably extract files the model declares
 SAVE_INSTRUCTION = (
-    "\n\nThe user will SAVE your output to files on disk. Output EVERY file you produce wrapped "
-    "EXACTLY like this, with only the file's raw contents between the markers (no code fences):\n"
+    "\n\nThe user will SAVE your output to files. Output EVERY file wrapped EXACTLY like this, with "
+    "only the file's raw contents between the markers (no code fences):\n"
     "<<<FILE relative/path.ext>>>\n<file contents>\n<<<END>>>\n"
     "Use relative paths, one block per file. Keep any short explanation OUTSIDE the markers."
 )
+
+_C = {"dim": "\033[2m", "b": "\033[1m", "cy": "\033[36m", "gr": "\033[32m",
+      "ye": "\033[33m", "rd": "\033[31m", "z": "\033[0m"}
 _FILE_RE = re.compile(r"<<<FILE\s+(.+?)>>>\n(.*?)\n<<<END>>>", re.DOTALL)
+_CODE_RE = re.compile(r"```[a-zA-Z0-9_+-]*\n(.*?)```", re.DOTALL)
 
 
-def save_files(reply, force):
-    """Parse <<<FILE>>> markers from the reply and write them. Returns count written."""
-    matches = _FILE_RE.findall(reply)
-    if not matches:
-        print(reply)  # model didn't use markers -> just show the answer
-        print(f"{_C['ye']}(no <<<FILE>>> blocks found — nothing saved){_C['z']}", file=sys.stderr)
-        return 0
-    prose = _FILE_RE.sub("", reply).strip()
-    if prose:
-        print(prose)
-    wrote = 0
-    for path, content in matches:
-        p = Path(path.strip())
-        if p.exists() and not force:
-            print(f"{_C['ye']}skip{_C['z']} {p}  (exists — use --force)", file=sys.stderr)
-            continue
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content)
-        print(f"{_C['gr']}✓ wrote{_C['z']} {p}  {_C['dim']}({len(content)} bytes){_C['z']}",
-              file=sys.stderr)
-        wrote += 1
-    return wrote
-
-
-def load_session(name):
-    if not name:
-        return []
-    path = os.path.join(SESS_DIR, f"{name}.json")
-    if os.path.exists(path):
-        with open(path) as f:
-            return json.load(f)
-    return []
-
-
-def save_session(name, messages):
-    if not name:
-        return
-    os.makedirs(SESS_DIR, exist_ok=True)
-    with open(os.path.join(SESS_DIR, f"{name}.json"), "w") as f:
-        json.dump(messages, f)
-
+# ---------- config ----------
 
 def load_config():
     cfg = {}
@@ -97,17 +60,18 @@ def load_config():
                 if line and not line.startswith("#") and "=" in line:
                     k, v = line.split("=", 1)
                     cfg[k.strip()] = v.strip()
-    url = os.environ.get("AXONATE_URL", cfg.get("AXONATE_URL", "http://127.0.0.1:4100"))
-    key = os.environ.get("AXONATE_KEY", cfg.get("AXONATE_KEY", ""))
-    cf_id = os.environ.get("AXONATE_CF_CLIENT_ID", cfg.get("AXONATE_CF_CLIENT_ID", ""))
-    cf_secret = os.environ.get("AXONATE_CF_CLIENT_SECRET", cfg.get("AXONATE_CF_CLIENT_SECRET", ""))
-    model = os.environ.get("AXONATE_MODEL", cfg.get("AXONATE_MODEL", "claude"))
-    system = os.environ.get("AXONATE_SYSTEM", cfg.get("AXONATE_SYSTEM", DEFAULT_SYSTEM))
-    return url.rstrip("/"), key, cf_id, cf_secret, model, system
+    g = lambda k, d="": os.environ.get(k, cfg.get(k, d))  # noqa: E731
+    return {
+        "url": g("AXONATE_URL", "http://127.0.0.1:4100").rstrip("/"),
+        "key": g("AXONATE_KEY"),
+        "cf_id": g("AXONATE_CF_CLIENT_ID"),
+        "cf_secret": g("AXONATE_CF_CLIENT_SECRET"),
+        "model": g("AXONATE_MODEL", "claude"),
+        "system": g("AXONATE_SYSTEM", DEFAULT_SYSTEM),
+    }
 
 
 def save_config_kv(k, v):
-    """Upsert key=value in ~/.config/axonate/config (preserve other lines)."""
     os.makedirs(os.path.dirname(CFG), exist_ok=True)
     lines, found = [], False
     if os.path.exists(CFG):
@@ -121,12 +85,11 @@ def save_config_kv(k, v):
         lines.append(f"{k}={v}\n")
     with open(CFG, "w") as f:
         f.writelines(lines)
+    os.chmod(CFG, 0o600)
 
 
 def build_headers(key, cf_id="", cf_secret=""):
-    """Request headers. Adds the Cloudflare Access service-token pair only when BOTH
-    cf_id and cf_secret are set (so api.* edge gate passes); backward-compatible otherwise."""
-    # custom User-Agent: urllib's default (Python-urllib/..) trips Cloudflare bot protection (1010)
+    # custom User-Agent: urllib's default trips Cloudflare bot protection (1010)
     h = {"Content-Type": "application/json", "User-Agent": "axonate-ax/1.0"}
     if key:
         h["Authorization"] = f"Bearer {key}"
@@ -136,9 +99,62 @@ def build_headers(key, cf_id="", cf_secret=""):
     return h
 
 
-_C = {"dim": "\033[2m", "b": "\033[1m", "cy": "\033[36m", "gr": "\033[32m",
-      "ye": "\033[33m", "z": "\033[0m"}
+# ---------- sessions ----------
 
+def load_session(name):
+    if not name:
+        return []
+    p = os.path.join(SESS_DIR, f"{name}.json")
+    return json.load(open(p)) if os.path.exists(p) else []
+
+
+def save_session(name, messages):
+    if not name:
+        return
+    os.makedirs(SESS_DIR, exist_ok=True)
+    json.dump(messages, open(os.path.join(SESS_DIR, f"{name}.json"), "w"))
+
+
+# ---------- pure helpers ----------
+
+def parse_slash(line):
+    """REPL input -> (command, arg) for a /slash line, else (None, text)."""
+    s = line.strip()
+    if not s.startswith("/"):
+        return (None, s)
+    parts = s[1:].split(None, 1)
+    return (parts[0].lower(), parts[1].strip() if len(parts) > 1 else "")
+
+
+def extract_first_code(reply):
+    """First fenced code block's content, or the whole reply if none."""
+    m = _CODE_RE.search(reply)
+    return m.group(1) if m else reply
+
+
+def save_files(reply, force):
+    """Write <<<FILE>>> blocks; print prose. Returns count written."""
+    matches = _FILE_RE.findall(reply)
+    if not matches:
+        print(reply)
+        print(f"{_C['ye']}(no <<<FILE>>> blocks — nothing saved){_C['z']}", file=sys.stderr)
+        return 0
+    prose = _FILE_RE.sub("", reply).strip()
+    if prose:
+        print(prose)
+    n = 0
+    for path, content in matches:
+        p = Path(path.strip())
+        if p.exists() and not force:
+            print(f"{_C['ye']}skip{_C['z']} {p}  (exists — use --force)", file=sys.stderr); continue
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content)
+        print(f"{_C['gr']}✓ wrote{_C['z']} {p}  {_C['dim']}({len(content)} bytes){_C['z']}", file=sys.stderr)
+        n += 1
+    return n
+
+
+# ---------- network ----------
 
 def fetch_models(url, headers):
     try:
@@ -149,142 +165,21 @@ def fetch_models(url, headers):
         return []
 
 
-def print_banner(url, key, headers, model):
-    c = _C
-    models = fetch_models(url, headers)
-    print(f"""{c['b']}{c['cy']}ax{c['z']} — Axonate gateway CLI
-  {c['dim']}gateway{c['z']}  {url}
-  {c['dim']}model  {c['z']}  {c['gr']}{model}{c['z']}  {c['dim']}(default; change: ax switch MODEL){c['z']}
-  {c['dim']}models {c['z']}  {(', '.join(models)) if models else c['ye'] + '(unreachable — run: ax status)' + c['z']}
-  {c['dim']}key    {c['z']}  {('…' + key[-6:]) if key else c['ye'] + 'MISSING (set AXONATE_KEY)' + c['z']}
-
-{c['b']}usage{c['z']}
-  ax "explain this error"                {c['dim']}# uses your default model ({model}){c['z']}
-  ax -m codex "write a regex"            {c['dim']}# override model for one call{c['z']}
-  git diff | ax "review this"            {c['dim']}# pipe stdin{c['z']}
-  ax -s work "remember X"                {c['dim']}# named session, multi-turn{c['z']}
-
-{c['b']}commands{c['z']}
-  ax switch MODEL  {c['dim']}set the default model (claude | codex | auto){c['z']}
-  ax models        {c['dim']}list available models{c['z']}
-  ax status        {c['dim']}gateway/config + reachability{c['z']}
-  ax usage         {c['dim']}your spend / budget / requests{c['z']}""")
-
-
-def cmd_usage(url, headers):
-    c = _C
-    try:
-        req = urllib.request.Request(f"{url}/v1/usage", headers=headers)
-        with urllib.request.urlopen(req, timeout=15) as r:
-            d = json.loads(r.read())
-    except Exception as e:
-        print(f"usage unavailable: {e}  (run: ax status)", file=sys.stderr)
-        sys.exit(1)
-    sp, bu, rem = d.get("spend"), d.get("budget"), d.get("remaining")
-    print(f"{c['b']}usage — {d.get('email', '')}{c['z']}")
-    print(f"  spend    : {('$%.4f' % sp) if sp is not None else '-'}")
-    if bu:
-        print(f"  budget   : ${bu}   {c['dim']}remaining{c['z']} ${rem}")
-    print(f"  requests : {d.get('requests', 0)}")
-    print(f"  tokens   : {d.get('tokens', 0)}")
-    sys.exit(0)
-
-
-def cmd_status(url, key, cf_id, headers, model):
-    c = _C
-    models = fetch_models(url, headers)
-    ok = bool(models)
-    print(f"{c['b']}axonate status{c['z']}")
-    print(f"  gateway : {url}")
-    print(f"  model   : {c['gr']}{model}{c['z']}  {c['dim']}(default){c['z']}")
-    print(f"  key     : {('…' + key[-6:]) if key else c['ye'] + 'MISSING' + c['z']}")
-    print(f"  cf-token: {'set' if cf_id else 'none'}")
-    print(f"  models  : {', '.join(models) if models else '-'}")
-    print(f"  reach   : {(c['gr'] + 'ok' + c['z']) if ok else c['ye'] + 'unreachable (check key/cf-token/url)' + c['z']}")
-    sys.exit(0 if ok else 1)
-
-
-def main():
-    ap = argparse.ArgumentParser(prog="ax", description="Axonate gateway CLI", add_help=True)
-    ap.add_argument("prompt", nargs="*", help="prompt text (or: models | status | usage | switch MODEL)")
-    ap.add_argument("-m", "--model", default="",
-                    help="model for this call: claude | codex | auto (overrides the saved default)")
-    ap.add_argument("--no-stream", action="store_true", help="disable streaming")
-    ap.add_argument("-s", "--session", default="", help="session name (persists history)")
-    ap.add_argument("--new", action="store_true", help="reset the session before this turn")
-    ap.add_argument("--system", default=None, help="override the system instruction for this call")
-    ap.add_argument("--raw", action="store_true", help="send NO system instruction (model's raw behavior)")
-    ap.add_argument("--save", action="store_true", help="write files the model declares (<<<FILE>>> blocks)")
-    ap.add_argument("--force", action="store_true", help="overwrite existing files when --save")
-    args = ap.parse_args()
-
-    url, key, cf_id, cf_secret, saved_model, saved_system = load_config()
-    headers = build_headers(key, cf_id, cf_secret)
-
-    # switch the persisted default model:  ax switch codex   (or: ax use codex)
-    if len(args.prompt) == 2 and args.prompt[0] in ("switch", "use"):
-        m = args.prompt[1]
-        avail = fetch_models(url, headers)
-        if avail and m not in avail and m != "auto":
-            print(f"{_C['ye']}'{m}' not in models{_C['z']}: {', '.join(avail)}", file=sys.stderr)
-            sys.exit(1)
-        save_config_kv("AXONATE_MODEL", m)
-        print(f"{_C['gr']}default model -> {m}{_C['z']}  (override per call with -m)")
-        return
-
-    model = args.model or saved_model    # -m overrides the saved default
-
-    # subcommands / banner
-    if args.prompt == ["models"]:
-        ms = fetch_models(url, headers)
-        if not ms:
-            print("no models (gateway unreachable or auth failed) — try: ax status", file=sys.stderr)
-            sys.exit(1)
-        print("\n".join(ms))
-        return
-    if args.prompt == ["status"]:
-        cmd_status(url, key, cf_id, headers, model)
-    if args.prompt == ["usage"]:
-        cmd_usage(url, headers)
-
-    prompt = " ".join(args.prompt)
-    if not sys.stdin.isatty():                 # piped stdin -> append
-        piped = sys.stdin.read().strip()
-        prompt = f"{prompt}\n\n{piped}" if prompt else piped
-    if not prompt:
-        print_banner(url, key, headers, model)        # friendly banner instead of a bare error
-        return
-
-    stream = not args.no_stream
-    history = [] if args.new else load_session(args.session)
-    system = "" if args.raw else (args.system if args.system is not None else saved_system)
-    if args.save:
-        system = (system + SAVE_INSTRUCTION).strip()
-    sysmsg = [{"role": "system", "content": system}] if system else []
-    messages = sysmsg + history + [{"role": "user", "content": prompt}]
-    body = json.dumps({
-        "model": model,
-        "messages": messages,
-        "stream": stream,
-    }).encode()
-
-    import itertools as _it
-    import threading as _th
-    import time as _t
-
-    started = _t.time()
-    _stop = _th.Event()
+def complete(url, headers, model, messages, *, stream=True, save=False, force=False, quiet=False):
+    """One chat turn. Streams/prints the reply (unless save), returns the reply text or None."""
+    body = json.dumps({"model": model, "messages": messages, "stream": stream}).encode()
+    started = time.time()
+    stop = threading.Event()
 
     def _spin():
-        frames = _it.cycle("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
-        while not _stop.is_set():
-            sys.stderr.write(f"\r{_C['dim']}{next(frames)} {model}…{_C['z']}")
-            sys.stderr.flush()
-            _t.sleep(0.1)
-        sys.stderr.write("\r" + " " * 24 + "\r")
-        sys.stderr.flush()
+        for fr in itertools.cycle("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"):
+            if stop.is_set():
+                break
+            sys.stderr.write(f"\r{_C['dim']}{fr} {model}…{_C['z']}"); sys.stderr.flush()
+            time.sleep(0.1)
+        sys.stderr.write("\r" + " " * 24 + "\r"); sys.stderr.flush()
 
-    spinner = _th.Thread(target=_spin, daemon=True)
+    spinner = threading.Thread(target=_spin, daemon=True)
     if sys.stderr.isatty():
         spinner.start()
 
@@ -292,7 +187,7 @@ def main():
     try:
         resp = urllib.request.urlopen(req)
     except urllib.error.HTTPError as e:
-        _stop.set()
+        stop.set()
         detail = e.read().decode()
         try:
             detail = json.loads(detail).get("detail", detail)
@@ -300,33 +195,32 @@ def main():
             pass
         hint = ""
         if e.code in (401, 403):
-            hint = "  (check AXONATE_KEY + CF service-token — run: ax status)"
+            hint = "  (check key/token — run: ax status)"
         elif e.code in (524, 504):
-            hint = "  (backend slow / timed out — try a shorter prompt or -m codex)"
+            hint = "  (backend slow/timeout — try a shorter prompt or -m codex)"
         print(f"{_C['ye']}error {e.code}{_C['z']}: {detail}{hint}", file=sys.stderr)
-        sys.exit(1)
+        return None
     except urllib.error.URLError as e:
-        _stop.set()
-        print(f"cannot reach gateway at {url}: {e.reason}", file=sys.stderr)
-        sys.exit(1)
+        stop.set()
+        print(f"{_C['rd']}cannot reach {url}{_C['z']}: {e.reason}", file=sys.stderr)
+        return None
 
     route = resp.headers.get("X-Router-Route") or model
     cache = resp.headers.get("X-Axonate-Cache", "")
+    _shown = [False]
 
-    def _stop_spinner_once(_done=[False]):
-        if not _done[0]:
-            _stop.set()
+    def first():
+        if not _shown[0]:
+            stop.set()
             if spinner.is_alive():
                 spinner.join(timeout=0.3)
-            print(f"{_C['dim']}— {route}{(' · cached' if cache == 'hit' else '')} —{_C['z']}",
-                  file=sys.stderr)
-            _done[0] = True
+            _shown[0] = True
 
     reply = ""
     if stream:
         for raw in resp:
             line = raw.decode().strip()
-            if not line.startswith("data: "):     # skips ': keepalive' heartbeat comments too
+            if not line.startswith("data: "):
                 continue
             data = line[6:]
             if data == "[DONE]":
@@ -336,30 +230,211 @@ def main():
             except (json.JSONDecodeError, KeyError, IndexError):
                 continue
             if delta:
-                _stop_spinner_once()
+                first()
                 reply += delta
-                if not args.save:                  # when saving, buffer + write files at the end
-                    sys.stdout.write(delta)
-                    sys.stdout.flush()
-        _stop_spinner_once()
-        if not args.save:
+                if not save:
+                    sys.stdout.write(delta); sys.stdout.flush()
+        first()
+        if not save:
             print()
     else:
-        data = json.loads(resp.read())
-        _stop_spinner_once()
-        reply = data["choices"][0]["message"]["content"]
-        if not args.save:
+        first()
+        reply = json.loads(resp.read())["choices"][0]["message"]["content"]
+        if not save:
             print(reply)
 
+    if save:
+        save_files(reply, force)
+    elif not quiet:
+        tag = f"{route}{' · cached' if cache == 'hit' else ''}"
+        print(f"{_C['dim']}[{tag} · {time.time() - started:.1f}s]{_C['z']}", file=sys.stderr)
+    return reply
+
+
+# ---------- commands ----------
+
+def cmd_models(url, headers):
+    ms = fetch_models(url, headers)
+    if not ms:
+        print("no models (gateway unreachable or auth failed) — try: ax status", file=sys.stderr)
+        sys.exit(1)
+    print("\n".join(ms))
+
+
+def cmd_usage(url, headers):
+    c = _C
+    try:
+        req = urllib.request.Request(f"{url}/v1/usage", headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as r:
+            d = json.loads(r.read())
+    except Exception as e:
+        print(f"usage unavailable: {e}  (run: ax status)", file=sys.stderr); return
+    sp, bu, rem = d.get("spend"), d.get("budget"), d.get("remaining")
+    print(f"{c['b']}usage — {d.get('email', '')}{c['z']}")
+    print(f"  spend    : {('$%.4f' % sp) if sp is not None else '-'}")
+    if bu:
+        print(f"  budget   : ${bu}   {c['dim']}remaining{c['z']} ${rem}")
+    print(f"  requests : {d.get('requests', 0)}")
+    print(f"  tokens   : {d.get('tokens', 0)}")
+
+
+def cmd_status(conf, headers):
+    c = _C
+    ms = fetch_models(conf["url"], headers)
+    ok = bool(ms)
+    print(f"{c['b']}axonate status{c['z']}")
+    print(f"  gateway : {conf['url']}")
+    print(f"  model   : {c['gr']}{conf['model']}{c['z']}  {c['dim']}(default){c['z']}")
+    print(f"  key     : {('…' + conf['key'][-6:]) if conf['key'] else c['ye'] + 'MISSING' + c['z']}")
+    print(f"  cf-token: {'set' if conf['cf_id'] else 'none'}")
+    print(f"  models  : {', '.join(ms) if ms else '-'}")
+    print(f"  reach   : {(c['gr'] + 'ok' + c['z']) if ok else c['ye'] + 'unreachable (check key/token/url)' + c['z']}")
+    sys.exit(0 if ok else 1)
+
+
+def cmd_setup():
+    c = _C
+    if not sys.stdin.isatty():
+        print("run 'ax setup' in an interactive terminal", file=sys.stderr); sys.exit(1)
+    cur = load_config()
+    print(f"{c['b']}ax setup{c['z']}  {c['dim']}(Enter keeps the shown value){c['z']}")
+
+    def ask(label, default):
+        v = input(f"  {label} [{default}]: ").strip()
+        return v or default
+
+    url = ask("gateway URL", cur["url"] or "https://api.clouddrove.in").rstrip("/")
+    key = ask("API key", cur["key"])
+    cf_id = ask("CF service-token id", cur["cf_id"])
+    cf_secret = ask("CF service-token secret", cur["cf_secret"])
+    model = ask("default model", cur["model"] or "claude")
+    for k, v in (("AXONATE_URL", url), ("AXONATE_KEY", key), ("AXONATE_CF_CLIENT_ID", cf_id),
+                 ("AXONATE_CF_CLIENT_SECRET", cf_secret), ("AXONATE_MODEL", model)):
+        save_config_kv(k, v)
+    print(f"{c['gr']}✓ saved {CFG}{c['z']}")
+    conf = load_config()
+    headers = build_headers(conf["key"], conf["cf_id"], conf["cf_secret"])
+    ok = bool(fetch_models(url, headers))
+    print(f"  reach   : {(c['gr'] + 'ok' + c['z']) if ok else c['ye'] + 'unreachable — re-check values' + c['z']}")
+
+
+# ---------- REPL ----------
+
+def repl(conf, headers):
+    c = _C
+    model = conf["model"]
+    print(f"{c['b']}{c['cy']}axonate{c['z']}  {c['dim']}{conf['url']} · {model} · /help · /exit{c['z']}")
+    history = []
+    while True:
+        try:
+            line = input(f"{c['cy']}axonate ({model}) ›{c['z']} ")
+        except (EOFError, KeyboardInterrupt):
+            print(); break
+        cmd, arg = parse_slash(line)
+        if cmd is not None:
+            if cmd in ("exit", "quit"):
+                break
+            if cmd == "help":
+                print(f"  {c['dim']}/model [name] · /save [path] · /usage · /clear · /exit{c['z']}")
+            elif cmd == "clear":
+                history = []; print(f"  {c['dim']}history cleared{c['z']}")
+            elif cmd == "usage":
+                cmd_usage(conf["url"], headers)
+            elif cmd == "model":
+                if not arg:
+                    print(f"  {c['dim']}current: {model}  available: {', '.join(fetch_models(conf['url'], headers))}{c['z']}")
+                else:
+                    av = fetch_models(conf["url"], headers)
+                    if av and arg not in av and arg != "auto":
+                        print(f"  {c['ye']}'{arg}' not in: {', '.join(av)}{c['z']}")
+                    else:
+                        model = arg; print(f"  {c['dim']}model -> {model}{c['z']}")
+            elif cmd == "save":
+                last = next((m["content"] for m in reversed(history) if m["role"] == "assistant"), "")
+                if not last:
+                    print(f"  {c['ye']}nothing to save yet{c['z']}")
+                elif _FILE_RE.search(last):
+                    save_files(last, force=False)
+                elif arg:
+                    Path(arg).write_text(extract_first_code(last))
+                    print(f"  {c['gr']}✓ wrote{c['z']} {arg}")
+                else:
+                    print(f"  {c['ye']}/save <path> to write the last code block{c['z']}")
+            else:
+                print(f"  {c['ye']}unknown command /{cmd} — /help{c['z']}")
+            continue
+        if not line.strip():
+            continue
+        msgs = [{"role": "system", "content": REPL_SYSTEM}] + history + [{"role": "user", "content": line}]
+        try:
+            reply = complete(conf["url"], headers, model, msgs, stream=True)
+        except KeyboardInterrupt:
+            print(f"\n  {c['dim']}(cancelled){c['z']}"); continue
+        if reply:
+            history += [{"role": "user", "content": line}, {"role": "assistant", "content": reply}]
+
+
+# ---------- main ----------
+
+def main():
+    ap = argparse.ArgumentParser(prog="ax", description="Axonate gateway CLI",
+                                 epilog="run 'ax' with no prompt for interactive chat; 'ax setup' to configure")
+    ap.add_argument("prompt", nargs="*", help="prompt text (or: setup | switch MODEL | models | status | usage)")
+    ap.add_argument("-m", "--model", default="", help="model for this call (claude | codex | auto)")
+    ap.add_argument("-s", "--session", default="", help="session name (persists history)")
+    ap.add_argument("--save", action="store_true", help="write files the model declares (<<<FILE>>> blocks)")
+    adv = ap.add_argument_group("advanced")
+    adv.add_argument("--no-stream", action="store_true", help="disable streaming")
+    adv.add_argument("--new", action="store_true", help="reset the session before this turn")
+    adv.add_argument("--force", action="store_true", help="overwrite existing files when --save")
+    adv.add_argument("-q", "--quiet", action="store_true", help="suppress the model/timing footer")
+    adv.add_argument("--system", default=None, help="override the system instruction")
+    adv.add_argument("--raw", action="store_true", help="send no system instruction")
+    args = ap.parse_args()
+
+    conf = load_config()
+    headers = build_headers(conf["key"], conf["cf_id"], conf["cf_secret"])
+
+    # bare commands
+    if args.prompt == ["setup"]:
+        return cmd_setup()
+    if args.prompt == ["models"]:
+        return cmd_models(conf["url"], headers)
+    if args.prompt == ["status"]:
+        return cmd_status(conf, headers)
+    if args.prompt == ["usage"]:
+        return cmd_usage(conf["url"], headers)
+    if len(args.prompt) == 2 and args.prompt[0] in ("switch", "use"):
+        m = args.prompt[1]
+        av = fetch_models(conf["url"], headers)
+        if av and m not in av and m != "auto":
+            print(f"{_C['ye']}'{m}' not in: {', '.join(av)}{_C['z']}", file=sys.stderr); sys.exit(1)
+        save_config_kv("AXONATE_MODEL", m)
+        print(f"{_C['gr']}default model -> {m}{_C['z']}"); return
+
+    model = args.model or conf["model"]
+
+    # assemble the prompt (text args + piped stdin)
+    prompt = " ".join(args.prompt)
+    if not sys.stdin.isatty():
+        piped = sys.stdin.read().strip()
+        prompt = f"{prompt}\n\n{piped}" if prompt else piped
+
+    if not prompt:
+        if sys.stdin.isatty():
+            return repl(conf, headers)              # interactive chat
+        ap.print_help(); return                     # piped, empty -> help
+
+    # one-shot
+    system = "" if args.raw else (args.system if args.system is not None else conf["system"])
     if args.save:
-        save_files(reply, args.force)
-
-    # footer: model + elapsed (+ a token count when non-stream gives usage)
-    elapsed = _t.time() - started
-    print(f"{_C['dim']}[{route} · {elapsed:.1f}s]{_C['z']}", file=sys.stderr)
-
+        system = (system + SAVE_INSTRUCTION).strip()
+    sysmsg = [{"role": "system", "content": system}] if system else []
+    history = [] if args.new else load_session(args.session)
+    messages = sysmsg + history + [{"role": "user", "content": prompt}]
+    reply = complete(conf["url"], headers, model, messages,
+                     stream=not args.no_stream, save=args.save, force=args.force, quiet=args.quiet)
     if args.session and reply:
-        # persist history WITHOUT the system message (it's re-prepended each turn)
         convo = [m for m in messages if m["role"] != "system"]
         save_session(args.session, convo + [{"role": "assistant", "content": reply}])
 
