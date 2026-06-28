@@ -102,7 +102,27 @@ def print_banner(url, key, headers):
 
 {c['b']}commands{c['z']}
   ax models     {c['dim']}list available models{c['z']}
-  ax status     {c['dim']}show gateway/config + reachability{c['z']}""")
+  ax status     {c['dim']}show gateway/config + reachability{c['z']}
+  ax usage      {c['dim']}your spend / budget / requests{c['z']}""")
+
+
+def cmd_usage(url, headers):
+    c = _C
+    try:
+        req = urllib.request.Request(f"{url}/v1/usage", headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as r:
+            d = json.loads(r.read())
+    except Exception as e:
+        print(f"usage unavailable: {e}  (run: ax status)", file=sys.stderr)
+        sys.exit(1)
+    sp, bu, rem = d.get("spend"), d.get("budget"), d.get("remaining")
+    print(f"{c['b']}usage — {d.get('email', '')}{c['z']}")
+    print(f"  spend    : {('$%.4f' % sp) if sp is not None else '-'}")
+    if bu:
+        print(f"  budget   : ${bu}   {c['dim']}remaining{c['z']} ${rem}")
+    print(f"  requests : {d.get('requests', 0)}")
+    print(f"  tokens   : {d.get('tokens', 0)}")
+    sys.exit(0)
 
 
 def cmd_status(url, key, cf_id, headers):
@@ -141,6 +161,8 @@ def main():
         return
     if args.prompt == ["status"]:
         cmd_status(url, key, cf_id, headers)
+    if args.prompt == ["usage"]:
+        cmd_usage(url, headers)
 
     prompt = " ".join(args.prompt)
     if not sys.stdin.isatty():                 # piped stdin -> append

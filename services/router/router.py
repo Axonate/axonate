@@ -967,6 +967,42 @@ async def models(request: Request):
     return JSONResponse(r.json(), status_code=r.status_code)
 
 
+@app.get("/v1/usage")
+async def usage(request: Request):
+    """The caller's own usage: spend/budget (LiteLLM) + request count/tokens (trace).
+    On the api surface a client can see only its own usage (keyed by its key)."""
+    try:
+        if _surface(request) == "api":
+            email, key = await _api_identity(request)
+        else:
+            email, key = auth_shim.resolve_identity(request.headers)
+    except AuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    out = {"email": email, "spend": None, "budget": None, "remaining": None,
+           "requests": 0, "tokens": 0}
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(f"{LITELLM_URL}/key/info", params={"key": key},
+                            headers={"Authorization": f"Bearer {os.environ.get('LITELLM_MASTER_KEY','')}"})
+        if r.status_code == 200:
+            info = (r.json() or {}).get("info", {}) or {}
+            out["spend"], out["budget"] = info.get("spend"), info.get("max_budget")
+    except httpx.HTTPError:
+        pass
+    if _pool is not None:
+        try:
+            async with _pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT count(*) AS n, COALESCE(SUM(total_tokens),0) AS t "
+                    "FROM axonate_trace WHERE user_email=$1", email)
+            out["requests"], out["tokens"] = row["n"], int(row["t"])
+        except Exception:  # noqa: BLE001 — usage is best-effort, never break on trace
+            pass
+    if out["spend"] is not None and out["budget"]:
+        out["remaining"] = round(float(out["budget"]) - float(out["spend"] or 0), 4)
+    return out
+
+
 @app.post("/v1/chat/completions")
 async def chat(request: Request):
     # 1. identity — api.* uses the caller's own key; otherwise resolve via auth_shim
