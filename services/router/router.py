@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
 import math
@@ -105,6 +106,109 @@ def _fallback_order(chosen: str, policy: dict) -> list[str]:
     backends = policy.get("backends", {})
     rest = sorted((b for b in backends if b != chosen), key=lambda b: backends[b].get("cost", 99))
     return [chosen, *rest]
+
+
+# ---------- scoring router (pure, unit-tested): task-fit + cost/budget + live health ----------
+
+# In-memory rolling health per backend: deque of (ok: bool, latency_ms: int), newest last.
+_health: dict = {}
+
+
+def _health_record(backend: str, ok: bool, latency_ms: int, window: int) -> None:
+    """Record one completed call's outcome for the backend's rolling health window."""
+    dq = _health.get(backend)
+    if dq is None or dq.maxlen != window:
+        dq = deque(dq or [], maxlen=window)
+        _health[backend] = dq
+    dq.append((bool(ok), int(latency_ms or 0)))
+
+
+def detect_tasks(prompt: str, policy: dict) -> set:
+    """Word-boundary task detection -> set of task tags (code/reason/summarize/...).
+    Word boundaries mean 'code' no longer matches 'encode'/'decode'."""
+    text = prompt.lower()
+    tags = set()
+    for tag, kws in policy.get("task_categories", {}).items():
+        for kw in kws:
+            kw = str(kw).lower().strip()
+            if kw and re.search(r"\b" + re.escape(kw) + r"\b", text):
+                tags.add(tag)
+                break
+    return tags
+
+
+def health_score(backend: str, policy: dict) -> float:
+    """Health in [0,1] from the rolling window: success-rate blended with speed.
+    Cold/unknown backend -> the neutral default (so a fresh router doesn't starve a backend)."""
+    sc = policy.get("scoring", {})
+    dq = _health.get(backend)
+    if not dq:
+        return float(sc.get("health_default", 0.7))
+    success = sum(1 for ok, _ in dq if ok) / len(dq)
+    mean_latency = sum(lat for _, lat in dq) / len(dq)
+    norm = float(sc.get("latency_norm_ms", 4000)) or 1.0
+    speed = 1.0 - min(mean_latency / norm, 1.0)
+    return round(0.7 * success + 0.3 * speed, 4)
+
+
+def is_circuit_broken(backend: str, policy: dict) -> bool:
+    """True when failures within the window reach circuit_break_failures."""
+    sc = policy.get("scoring", {})
+    dq = _health.get(backend)
+    if not dq:
+        return False
+    fails = sum(1 for ok, _ in dq if not ok)
+    return fails >= int(sc.get("circuit_break_failures", 3))
+
+
+def score_backends(tasks: set, near_budget: bool, health_map: dict, policy: dict):
+    """Pure scorer. Returns (best_backend, reason, ranked_list).
+      score(b) = w_task*task_fit + w_cost'*cost_fit + w_health*health
+                 - circuit_break_penalty (if broken)
+    cost weight is boosted when the task is easy/empty or the caller is near budget."""
+    sc = policy.get("scoring", {})
+    w = sc.get("weights", {})
+    backends = policy.get("backends", {})
+    costs = [b.get("cost", 1) for b in backends.values()] or [1]
+    mn, mx = min(costs), max(costs)
+    easy = (not tasks) or near_budget
+    wcost = float(w.get("cost", 0.5)) * (float(sc.get("cost_easy_boost", 2.0)) if easy else 1.0)
+
+    rows = []
+    for name, meta in backends.items():
+        strengths = set(meta.get("strengths", []))
+        task_fit = (len(tasks & strengths) / len(tasks)) if tasks else 0.0
+        cost = meta.get("cost", 1)
+        cost_fit = (mx - cost) / (mx - mn) if mx != mn else 1.0
+        health = float(health_map.get(name, health_score(name, policy)))
+        score = float(w.get("task", 1.0)) * task_fit + wcost * cost_fit + float(w.get("health", 0.75)) * health
+        broken = is_circuit_broken(name, policy)
+        if broken:
+            score -= float(sc.get("circuit_break_penalty", 100))
+        rows.append({"name": name, "score": score, "cost": cost, "fit": task_fit, "broken": broken})
+
+    if not rows:                                   # no backends configured -> policy default
+        d = policy.get("default", "")
+        return d, "no backends configured", [d] if d else []
+    rows.sort(key=lambda r: (-r["score"], r["cost"], r["name"]))  # deterministic
+    best = rows[0]
+    if best["broken"]:
+        reason = f"all backends degraded -> {best['name']} (least-bad)"
+    elif near_budget:
+        reason = f"near budget -> {best['name']} (cheapest healthy)"
+    elif best["fit"] > 0:
+        reason = f"{'/'.join(sorted(tasks))} task -> {best['name']}"
+    else:
+        reason = f"no strong signal -> {best['name']} (cheap + healthy)"
+    return best["name"], reason, [r["name"] for r in rows]
+
+
+def _decide_scored(prompt: str, near_budget: bool, policy: dict):
+    """Scored 'auto' decision. Returns (backend, reason, ranked). Wraps the pure units with the
+    live in-memory health snapshot."""
+    tasks = detect_tasks(prompt, policy)
+    health_map = {b: health_score(b, policy) for b in policy.get("backends", {})}
+    return score_backends(tasks, near_budget, health_map, policy)
 
 
 # ---------- spend / quota (cost-quota signal, best-effort) ----------
@@ -292,9 +396,16 @@ async def health():
 
 @app.get("/route/explain")
 async def route_explain(prompt: str):
-    """Show the routing decision for a prompt WITHOUT forwarding. Debug/acceptance aid."""
+    """Show the routing decision for a prompt WITHOUT forwarding. Debug/acceptance + tuning aid."""
+    if _policy.get("scoring", {}).get("enabled"):
+        tasks = detect_tasks(prompt, _policy)
+        chosen, reason, order = _decide_scored(prompt, False, _policy)
+        return {"prompt_len": len(prompt), "mode": "scoring", "route": chosen, "reason": reason,
+                "tasks": sorted(tasks), "fallback_order": order,
+                "health": {b: health_score(b, _policy) for b in _policy.get("backends", {})},
+                "circuit_broken": [b for b in _policy.get("backends", {}) if is_circuit_broken(b, _policy)]}
     chosen, reason = _decide(prompt, _policy)
-    return {"prompt_len": len(prompt), "route": chosen, "reason": reason,
+    return {"prompt_len": len(prompt), "mode": "legacy", "route": chosen, "reason": reason,
             "fallback_order": _fallback_order(chosen, _policy)}
 
 
@@ -713,36 +824,41 @@ async def chat(request: Request):
 
     # 3. route
     if requested == "auto":
-        chosen, reason = _decide(prompt, _policy)
-        if await _near_limit(key):
+        near = await _near_limit(key)
+        if _policy.get("scoring", {}).get("enabled"):
+            chosen, reason, order = _decide_scored(prompt, near, _policy)   # ranked list = fallback order
+        else:
+            chosen, reason = _decide(prompt, _policy)
             order = _fallback_order(chosen, _policy)
-            for alt in order:
-                if not await _near_limit(key):
-                    break
-            reason += " | near budget limit"
-        order = _fallback_order(chosen, _policy)
+            if near:
+                reason += " | near budget limit"
     else:
         chosen, reason = requested, "explicit model"
         order = [requested]
 
     print(f"[route] user={user} requested={requested} -> {chosen} ({reason})", flush=True)
 
-    # 4. forward with fallback
+    # 4. forward with fallback (record verified outcomes into the in-memory health window)
     started = time.time()
     last_err = None
+    hwin = int(_policy.get("scoring", {}).get("health_window", 20))
     for attempt, backend in enumerate(order):
         fwd = dict(body, model=backend)
+        t0 = time.time()
         try:
             if stream:
+                # streaming connects lazily inside the generator; health for streams is best-effort
                 return await _forward_stream(fwd, key, user, requested, backend, reason, prompt)
             resp = await _forward_once(fwd, key)
             latency = int((time.time() - started) * 1000)
+            _health_record(backend, resp["status"] < 500, int((time.time() - t0) * 1000), hwin)
             await _trace_from_response(resp, user, requested, backend, reason, latency, prompt)
             out = JSONResponse(resp["json"], status_code=resp["status"])
             out.headers["X-Router-Route"] = backend
             out.headers["X-Router-Reason"] = reason + (f" (fallback #{attempt})" if attempt else "")
             return out
         except (httpx.HTTPError, _UpstreamError) as e:
+            _health_record(backend, False, int((time.time() - t0) * 1000), hwin)
             last_err = e
             print(f"[fallback] {backend} failed ({e}); trying next", flush=True)
             continue
@@ -824,16 +940,29 @@ async def _forward_once(body: dict, key: str) -> dict:
 async def _forward_stream(body, key, user, requested, backend, reason, prompt):
     started = time.time()
 
+    hwin = int(_policy.get("scoring", {}).get("health_window", 20))
+
     async def gen():
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
-            async with c.stream("POST", f"{LITELLM_URL}/v1/chat/completions",
-                                 json=body, headers={"Authorization": f"Bearer {key}"}) as r:
-                async for chunk in r.aiter_bytes():
-                    yield chunk
+        ok, status = True, 200
+        try:
+            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
+                async with c.stream("POST", f"{LITELLM_URL}/v1/chat/completions",
+                                     json=body, headers={"Authorization": f"Bearer {key}"}) as r:
+                    status = r.status_code
+                    if status >= 500:
+                        ok = False
+                    async for chunk in r.aiter_bytes():
+                        yield chunk
+        except Exception:
+            ok = False
+            raise
+        finally:
+            # record the streamed call's outcome so health-based routing works for streams too
+            _health_record(backend, ok, int((time.time() - started) * 1000), hwin)
         latency = int((time.time() - started) * 1000)
         await _trace({"user": user, "model_requested": requested, "route": backend,
                       "reason": reason, "latency_ms": latency, "pt": 0, "ct": 0, "tt": 0,
-                      "cost": None, "status": 200,
+                      "cost": None, "status": status,
                       "prompt_text": prompt if LOG_PROMPTS else None})
 
     resp = StreamingResponse(gen(), media_type="text/event-stream")

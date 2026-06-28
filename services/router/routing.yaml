@@ -5,13 +5,13 @@
 backends:
   claude:
     cost: 3          # relative cost rank (1=cheapest). Used by the cost/quota signal.
-    strengths: [reasoning, analysis, writing]
+    strengths: [reason, analysis, writing]   # 'reason' aligns with a task_categories key
   codex:
     cost: 3
-    strengths: [code, refactor, debug]
+    strengths: [code, refactor, debug]       # 'code' aligns with a task_categories key
   minimax:
     cost: 1          # cheapest/most abundant -> preferred for easy + bulk work
-    strengths: [bulk, transform, summarize]
+    strengths: [summarize, bulk, transform]  # 'summarize' aligns with a task_categories key
 
 default: minimax     # fallback when no rule matches
 
@@ -40,3 +40,23 @@ cost_quota:
 # Optional LLM classifier (off for POC — keyword+length+cost is enough).
 classifier:
   enabled: false
+
+# ---- Scoring router (the differentiator). When enabled, model:auto picks the backend by
+# scoring task-fit + cost/budget + live health, instead of first-match-wins. Set enabled:false
+# to roll back to the legacy keyword router above. Retune weights/knobs here; restart router.
+scoring:
+  enabled: true
+  weights: { task: 1.0, cost: 0.5, health: 0.75 }
+  cost_easy_boost: 2.0          # multiply the cost weight when the task is easy/empty OR near budget
+  health_window: 20             # recent calls per backend kept for the in-memory health signal
+  latency_norm_ms: 4000         # latency at/above this -> speed component 0
+  circuit_break_failures: 3     # >= this many failures within the window -> backend circuit-broken
+  circuit_break_penalty: 100    # score penalty for a circuit-broken backend (so it's skipped)
+  health_default: 0.7           # neutral health for a cold/unknown backend
+
+# Word-boundary task detection (replaces the brittle substring keyword_rules when scoring is on).
+# Each detected tag is matched against a backend's `strengths`.
+task_categories:
+  code:      [code, function, refactor, debug, bug, compile, "stack trace", regex, def, class, import]
+  reason:    [reason, analyze, "explain why", design, architecture, "trade-off", plan, prove]
+  summarize: [summarize, summary, translate, bulk, extract, classify, rewrite, transform, list]
