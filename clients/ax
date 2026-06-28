@@ -24,6 +24,16 @@ import urllib.request
 CFG = os.path.expanduser("~/.config/axonate/config")
 SESS_DIR = os.path.expanduser("~/.config/axonate/sessions")
 
+# one-shot CLI default: answer directly, assume sensible defaults, never ask back (ax isn't interactive)
+DEFAULT_SYSTEM = (
+    "You are a non-interactive command-line assistant answering a single shot. The user CANNOT "
+    "reply, so NEVER ask clarifying questions and NEVER offer to do follow-up work. If the request "
+    "is underspecified, pick the most common sensible defaults and proceed. Do NOT write a plan, "
+    "preamble, or 'here is what I'll do' — give the final answer directly. For code requests, "
+    "output the complete ready-to-run script in a single code block, with at most one short line of "
+    "assumptions above it. Be concise."
+)
+
 
 def load_session(name):
     if not name:
@@ -57,7 +67,8 @@ def load_config():
     cf_id = os.environ.get("AXONATE_CF_CLIENT_ID", cfg.get("AXONATE_CF_CLIENT_ID", ""))
     cf_secret = os.environ.get("AXONATE_CF_CLIENT_SECRET", cfg.get("AXONATE_CF_CLIENT_SECRET", ""))
     model = os.environ.get("AXONATE_MODEL", cfg.get("AXONATE_MODEL", "claude"))
-    return url.rstrip("/"), key, cf_id, cf_secret, model
+    system = os.environ.get("AXONATE_SYSTEM", cfg.get("AXONATE_SYSTEM", DEFAULT_SYSTEM))
+    return url.rstrip("/"), key, cf_id, cf_secret, model, system
 
 
 def save_config_kv(k, v):
@@ -166,9 +177,11 @@ def main():
     ap.add_argument("--no-stream", action="store_true", help="disable streaming")
     ap.add_argument("-s", "--session", default="", help="session name (persists history)")
     ap.add_argument("--new", action="store_true", help="reset the session before this turn")
+    ap.add_argument("--system", default=None, help="override the system instruction for this call")
+    ap.add_argument("--raw", action="store_true", help="send NO system instruction (model's raw behavior)")
     args = ap.parse_args()
 
-    url, key, cf_id, cf_secret, saved_model = load_config()
+    url, key, cf_id, cf_secret, saved_model, saved_system = load_config()
     headers = build_headers(key, cf_id, cf_secret)
 
     # switch the persisted default model:  ax switch codex   (or: ax use codex)
@@ -207,7 +220,9 @@ def main():
 
     stream = not args.no_stream
     history = [] if args.new else load_session(args.session)
-    messages = history + [{"role": "user", "content": prompt}]
+    system = "" if args.raw else (args.system if args.system is not None else saved_system)
+    sysmsg = [{"role": "system", "content": system}] if system else []
+    messages = sysmsg + history + [{"role": "user", "content": prompt}]
     body = json.dumps({
         "model": model,
         "messages": messages,
@@ -299,7 +314,9 @@ def main():
     print(f"{_C['dim']}[{route} · {elapsed:.1f}s]{_C['z']}", file=sys.stderr)
 
     if args.session and reply:
-        save_session(args.session, messages + [{"role": "assistant", "content": reply}])
+        # persist history WITHOUT the system message (it's re-prepended each turn)
+        convo = [m for m in messages if m["role"] != "system"]
+        save_session(args.session, convo + [{"role": "assistant", "content": reply}])
 
 
 if __name__ == "__main__":
