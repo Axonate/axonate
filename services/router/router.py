@@ -255,7 +255,7 @@ def cache_get(key: str, now: float):
     if now >= exp:
         _cache.pop(key, None)
         return None
-    return value
+    return dict(value)   # shallow copy so a caller can't mutate the stored object
 
 
 def cache_set(key: str, value: dict, now: float, ttl: float, max_entries: int) -> None:
@@ -1093,8 +1093,7 @@ async def _forward_stream(body, key, user, requested, backend, reason, prompt,
     resp = StreamingResponse(gen(), media_type="text/event-stream")
     resp.headers["X-Router-Route"] = backend
     resp.headers["X-Router-Reason"] = reason
-    if cache_k:
-        resp.headers["X-Axonate-Cache"] = "miss"
+    resp.headers["X-Axonate-Cache"] = "miss" if cache_k else "off"
     return resp
 
 
