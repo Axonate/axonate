@@ -54,6 +54,15 @@ scoring:
   circuit_break_penalty: 100    # score penalty for a circuit-broken backend (so it's skipped)
   health_default: 0.7           # neutral health for a cold/unknown backend
 
+# ---- Response cache (exact-match, in-memory). Identical low-temperature requests return instantly
+# without a backend call (cost + latency win). Bypass per-request with body {"cache": false} or the
+# X-Axonate-No-Cache header; force with {"cache": true}. enabled:false fully disables.
+cache:
+  enabled: true
+  ttl_seconds: 3600       # how long a cached response stays valid
+  max_temperature: 0.5    # only cache requests at/below this temperature (absent temp -> not cached)
+  max_entries: 1000       # bounded; evicts soonest-to-expire when full
+
 # Word-boundary task detection (replaces the brittle substring keyword_rules when scoring is on).
 # Each detected tag is matched against a backend's `strengths`.
 task_categories:

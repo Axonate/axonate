@@ -15,6 +15,7 @@ This is permanent (production-grade). It does NOT change at the POC->prod swap.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -209,6 +210,91 @@ def _decide_scored(prompt: str, near_budget: bool, policy: dict):
     tasks = detect_tasks(prompt, policy)
     health_map = {b: health_score(b, policy) for b in policy.get("backends", {})}
     return score_backends(tasks, near_budget, health_map, policy)
+
+
+# ---------- response cache (exact-match, in-memory; pure helpers + bounded store) ----------
+
+_cache: dict = {}   # cache_key -> (response_json, expires_at)
+_CACHE_FIELDS = ("model", "messages", "temperature", "max_tokens", "top_p")
+
+
+def cache_key(body: dict) -> str:
+    """Stable global key = sha256 of the cache-relevant request subset (no user identity)."""
+    sub = {k: body.get(k) for k in _CACHE_FIELDS}
+    return hashlib.sha256(json.dumps(sub, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def is_cacheable(body: dict, headers, policy: dict) -> bool:
+    """Cacheable when enabled, not bypassed, and (low temperature or explicitly forced)."""
+    cfg = policy.get("cache", {})
+    if not cfg.get("enabled"):
+        return False
+    hdrs = {str(k).lower(): v for k, v in dict(headers).items()}
+    if hdrs.get("x-axonate-no-cache"):
+        return False
+    c = body.get("cache")
+    if c is False:
+        return False
+    if c is True:
+        return True
+    temp = body.get("temperature")
+    if temp is None:
+        return False
+    try:
+        return float(temp) <= float(cfg.get("max_temperature", 0.5))
+    except (TypeError, ValueError):
+        return False
+
+
+def cache_get(key: str, now: float):
+    """Return the stored response if present + unexpired; drop + None if expired."""
+    e = _cache.get(key)
+    if not e:
+        return None
+    value, exp = e
+    if now >= exp:
+        _cache.pop(key, None)
+        return None
+    return value
+
+
+def cache_set(key: str, value: dict, now: float, ttl: float, max_entries: int) -> None:
+    """Store with TTL; evict soonest-to-expire entries when over max_entries."""
+    _cache[key] = (value, now + ttl)
+    if len(_cache) > max_entries:
+        for k, _ in sorted(_cache.items(), key=lambda kv: kv[1][1])[:len(_cache) - max_entries]:
+            _cache.pop(k, None)
+
+
+def _synth_completion(content: str, model: str) -> dict:
+    """Reconstruct an OpenAI chat completion from accumulated streamed content (for caching)."""
+    return {"object": "chat.completion", "model": model, "usage": {},
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": content}}]}
+
+
+def _completion_content(value: dict) -> str:
+    try:
+        return value["choices"][0]["message"]["content"] or ""
+    except (KeyError, IndexError, TypeError):
+        return ""
+
+
+def _sse_deltas(chunk: bytes) -> str:
+    """Extract concatenated delta.content from a raw SSE byte chunk (best-effort, for cache capture)."""
+    out = []
+    for line in chunk.decode(errors="ignore").splitlines():
+        line = line.strip()
+        if not line.startswith("data: "):
+            continue
+        data = line[6:]
+        if data == "[DONE]":
+            continue
+        try:
+            out.append(json.loads(data)["choices"][0]["delta"].get("content", "") or "")
+        except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+            continue
+    return "".join(out)
 
 
 # ---------- spend / quota (cost-quota signal, best-effort) ----------
@@ -822,6 +908,32 @@ async def chat(request: Request):
     stream = bool(body.get("stream"))
     prompt = _last_user_text(body.get("messages", []))
 
+    # 2.5 response cache (exact match) — identical low-temp requests skip the backend entirely
+    ccfg = _policy.get("cache", {})
+    cacheable = is_cacheable(body, request.headers, _policy)
+    ckey = cache_key(body) if cacheable else None
+    if cacheable:
+        hit = cache_get(ckey, time.time())
+        if hit is not None:
+            await _trace({"user": user, "model_requested": requested, "route": "cache",
+                          "reason": "cache hit", "latency_ms": 0, "pt": 0, "ct": 0,
+                          "tt": (hit.get("usage", {}) or {}).get("total_tokens", 0),
+                          "cost": 0.0, "status": 200,
+                          "prompt_text": prompt if LOG_PROMPTS else None})
+            if stream:
+                async def _replay():
+                    yield ("data: " + json.dumps(
+                        {"choices": [{"delta": {"content": _completion_content(hit)}}]}) + "\n\n").encode()
+                    yield b"data: [DONE]\n\n"
+                r = StreamingResponse(_replay(), media_type="text/event-stream")
+                r.headers["X-Axonate-Cache"] = "hit"
+                r.headers["X-Router-Route"] = "cache"
+                return r
+            out = JSONResponse(hit, status_code=200)
+            out.headers["X-Axonate-Cache"] = "hit"
+            out.headers["X-Router-Route"] = "cache"
+            return out
+
     # 3. route
     if requested == "auto":
         near = await _near_limit(key)
@@ -847,15 +959,20 @@ async def chat(request: Request):
         t0 = time.time()
         try:
             if stream:
-                # streaming connects lazily inside the generator; health for streams is best-effort
-                return await _forward_stream(fwd, key, user, requested, backend, reason, prompt)
+                # streaming connects lazily inside the generator; health + cache are recorded there
+                return await _forward_stream(fwd, key, user, requested, backend, reason, prompt,
+                                             ckey if cacheable else None, ccfg)
             resp = await _forward_once(fwd, key)
             latency = int((time.time() - started) * 1000)
             _health_record(backend, resp["status"] < 500, int((time.time() - t0) * 1000), hwin)
             await _trace_from_response(resp, user, requested, backend, reason, latency, prompt)
+            if cacheable and resp["status"] < 400:
+                cache_set(ckey, resp["json"], time.time(),
+                          ccfg.get("ttl_seconds", 3600), ccfg.get("max_entries", 1000))
             out = JSONResponse(resp["json"], status_code=resp["status"])
             out.headers["X-Router-Route"] = backend
             out.headers["X-Router-Reason"] = reason + (f" (fallback #{attempt})" if attempt else "")
+            out.headers["X-Axonate-Cache"] = "miss" if cacheable else "off"
             return out
         except (httpx.HTTPError, _UpstreamError) as e:
             _health_record(backend, False, int((time.time() - t0) * 1000), hwin)
@@ -937,13 +1054,15 @@ async def _forward_once(body: dict, key: str) -> dict:
     return {"json": r.json(), "status": r.status_code, "cost": float(cost) if cost else None}
 
 
-async def _forward_stream(body, key, user, requested, backend, reason, prompt):
+async def _forward_stream(body, key, user, requested, backend, reason, prompt,
+                          cache_k=None, ccfg=None):
     started = time.time()
 
     hwin = int(_policy.get("scoring", {}).get("health_window", 20))
 
     async def gen():
         ok, status = True, 200
+        parts = []          # accumulate streamed content for the response cache
         try:
             async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
                 async with c.stream("POST", f"{LITELLM_URL}/v1/chat/completions",
@@ -952,6 +1071,8 @@ async def _forward_stream(body, key, user, requested, backend, reason, prompt):
                     if status >= 500:
                         ok = False
                     async for chunk in r.aiter_bytes():
+                        if cache_k:
+                            parts.append(_sse_deltas(chunk))
                         yield chunk
         except Exception:
             ok = False
@@ -959,6 +1080,10 @@ async def _forward_stream(body, key, user, requested, backend, reason, prompt):
         finally:
             # record the streamed call's outcome so health-based routing works for streams too
             _health_record(backend, ok, int((time.time() - started) * 1000), hwin)
+        # cache the reconstructed completion on a clean stream (so streams populate the cache too)
+        if cache_k and ok and status < 400:
+            cache_set(cache_k, _synth_completion("".join(parts), backend), time.time(),
+                      (ccfg or {}).get("ttl_seconds", 3600), (ccfg or {}).get("max_entries", 1000))
         latency = int((time.time() - started) * 1000)
         await _trace({"user": user, "model_requested": requested, "route": backend,
                       "reason": reason, "latency_ms": latency, "pt": 0, "ct": 0, "tt": 0,
@@ -968,6 +1093,8 @@ async def _forward_stream(body, key, user, requested, backend, reason, prompt):
     resp = StreamingResponse(gen(), media_type="text/event-stream")
     resp.headers["X-Router-Route"] = backend
     resp.headers["X-Router-Reason"] = reason
+    if cache_k:
+        resp.headers["X-Axonate-Cache"] = "miss"
     return resp
 
 
