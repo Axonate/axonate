@@ -56,7 +56,7 @@ jobs:
       # and config/ too), with the router Dockerfile.
       - name: Build and push
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: services/router/Dockerfile
